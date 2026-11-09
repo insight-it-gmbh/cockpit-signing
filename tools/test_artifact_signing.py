@@ -446,6 +446,34 @@ class AblageClient(unittest.TestCase):
         self.assertEqual(code_von(a.lade, BID, "quality", 10, fehlt_code="quality_fehlt"), "quality_fehlt")
         self.assertEqual(code_von(sig.Ablage(Aufzeichner([(200, b"kein json")]), TOKEN_TEST).manifest, BID), "manifest_ungueltig")
 
+    def test_409_meldung_je_methode_und_antwortkoerper(self):
+        """M1: 409 bei GET/Manifest heißt „inkonsistent“ (Daten ≠ Prüfsumme), nicht „existiert bereits“; PUT bleibt Konflikt."""
+        sha = hashlib.sha256(b"MZ").hexdigest()
+        inkonsistent = json.dumps({"detail": {"code": "inkonsistent", "meldung": "x " + TOKEN_TEST}}).encode()
+        vorhanden = json.dumps({"detail": {"code": "vorhanden", "meldung": "x"}}).encode()
+        for koerper in (b"", inkonsistent, b"kein json " + TOKEN_TEST.encode(), b'{"detail": {"code": "unbekannt"}}'):
+            for name, aufruf in (("manifest", lambda a: a.manifest(BID)),
+                                 ("lade", lambda a: a.lade(BID, "unsigned", 100))):
+                with self.subTest(aufruf=name, koerper=koerper[:20]):
+                    a = sig.Ablage(Aufzeichner([(409, koerper)]), TOKEN_TEST)
+                    self.assertEqual(code_von(aufruf, a), "storage_konflikt")
+                    text = meldung_von(aufruf, sig.Ablage(Aufzeichner([(409, koerper)]), TOKEN_TEST))
+                    self.assertIn("inkonsistent", text)
+                    self.assertNotIn("existiert bereits", text)
+                    self.assertIn("HTTP 409", text)
+                    self.assertNotIn(TOKEN_TEST, text)
+        self.assertIn("Manifest", meldung_von(sig.Ablage(Aufzeichner([(409, b"")]), TOKEN_TEST).manifest, BID))
+        for koerper in (b"", vorhanden, b"kein json"):
+            with self.subTest(aufruf="lege_ab", koerper=koerper[:20]):
+                a = sig.Ablage(Aufzeichner([(409, koerper)]), TOKEN_TEST)
+                self.assertEqual(code_von(a.lege_ab, BID, "signed", b"MZ", sha), "storage_konflikt")
+                text = meldung_von(sig.Ablage(Aufzeichner([(409, koerper)]), TOKEN_TEST).lege_ab, BID, "signed", b"MZ", sha)
+                self.assertIn("existiert bereits", text)
+                self.assertNotIn("inkonsistent", text)
+        text = meldung_von(sig.Ablage(Aufzeichner([(409, inkonsistent)]), TOKEN_TEST).lege_ab, BID, "signed", b"MZ", sha)
+        self.assertIn("inkonsistent", text)                 # Antwortkörper hat Vorrang vor der Methode
+        self.assertNotIn(TOKEN_TEST, text)
+
     def test_token_und_eingaben_vor_jeder_anfrage_geprueft(self):
         t = Aufzeichner([])
         for token, code in (("", "storage_token_fehlt"), ("   ", "storage_token_fehlt"), ("kurz", "storage_token_format"),

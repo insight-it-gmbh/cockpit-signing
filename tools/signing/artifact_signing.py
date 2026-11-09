@@ -110,6 +110,11 @@ STATUS_CODES = {400: ("storage_anfrage", "Ablage lehnt die Anfrage ab (ungültig
                 413: ("storage_zu_gross", "Datei ist für die Ablage zu groß (max. 200 MiB)"),
                 422: ("storage_abgelehnt", "Ablage lehnt den Inhalt ab (Hash, Format oder Qualitätsnachweis ungültig)"),
                 503: ("storage_nicht_konfiguriert", "Ablage hat serverseitig kein Token konfiguriert")}
+# 409 je Ursache: PUT ohne replace → „vorhanden“; GET/Manifest → „inkonsistent“ (gespeicherte Daten ≠ Prüfsumme).
+KONFLIKT_INKONSISTENT = "Ablage meldet das Artefakt als inkonsistent (gespeicherte Daten passen nicht zur Prüfsumme) " \
+                        "– nicht verwenden, Ablage prüfen"
+KONFLIKT_MANIFEST = "Ablage verweigert das Manifest: mindestens ein Artefakt des Builds ist inkonsistent " \
+                    "(gespeicherte Daten passen nicht zur Prüfsumme) – nicht verwenden, Ablage prüfen"
 
 
 class SigningError(Exception):
@@ -703,6 +708,8 @@ class Ablage:
         if status == 404:
             raise SigningError(fehlt[0], "Ablage meldet 404: %s" % fehlt[1])
         code, meldung = STATUS_CODES.get(status, ("storage_fehler", "Ablage antwortet mit HTTP %s" % status))
+        if status == 409:
+            meldung = _konflikt_meldung(methode, url, daten, meldung)
         raise SigningError(code, "%s (HTTP %s)" % (meldung, status))
 
     def manifest(self, build_id):
@@ -723,6 +730,25 @@ class Ablage:
         typ = "application/json" if kind == "quality" else "application/octet-stream"
         self._anfrage("PUT", self._url(build_id, kind), body=data,
                       kopf={"X-Artifact-SHA256": sha256, "Content-Type": typ, "Content-Length": str(len(data))})
+
+
+def _antwort_code(daten):
+    """Nur `detail.code` aus einer JSON-Fehlerantwort (Whitelist-Abgleich beim Aufrufer); nie Antworttext übernehmen."""
+    try:
+        doc = json.loads(bytes(daten or b"")[:4096].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, TypeError, RecursionError):
+        return None
+    detail = doc.get("detail") if isinstance(doc, dict) else None
+    code = detail.get("code") if isinstance(detail, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _konflikt_meldung(methode, url, daten, standard):
+    """409 präzise benennen: Antwortkörper (`vorhanden`/`inkonsistent`) vor Methode; PUT = existiert bereits."""
+    code = _antwort_code(daten)
+    if code == "vorhanden" or (code != "inkonsistent" and methode == "PUT"):
+        return standard
+    return KONFLIKT_MANIFEST if url.endswith("/manifest") else KONFLIKT_INKONSISTENT
 
 
 def pruefe_manifest(m, build_id, kind, sha256=None, fehlt_code="asset_fehlt", abweichung_code="digest_abweichung"):
