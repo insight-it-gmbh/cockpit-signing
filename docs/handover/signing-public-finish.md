@@ -39,7 +39,7 @@ bisherigen privaten Repository). Kein GitHub-Repository angelegt, kein Push, kei
 ## Testbefehle
 
 ```bash
-python3 tools/test_artifact_signing.py      # erwartet: 60 Tests OK (1 Skip ohne PyYAML)
+python3 tools/test_artifact_signing.py      # erwartet: 62 Tests OK (1 Skip ohne PyYAML)
 python3 tools/signing/workflow_check.py     # erwartet: ohne Befund
 python3 tools/signing/trockenlauf.py        # erwartet: 55/55 Szenarien wie erwartet
 uv run --no-project --with pyyaml python3 tools/test_artifact_signing.py   # optional: YAML-Gegenprobe ohne Skip

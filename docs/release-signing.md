@@ -343,12 +343,18 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
 3. In einer bash das Token aus dem Passwortmanager übernehmen, ohne es in Dateien oder den Verlauf zu schreiben:
    `read -rs SIGNING_STORAGE_TOKEN && export SIGNING_STORAGE_TOKEN`.
 4. `python3 tools/signing/vorbereiten.py <installer> --quality <quality.json> --version <version> --erstausrollung
-   --repo <owner/repo>` – prüft den Build wie die Vorprüfung und quality.json wie der Workflow, legt
-   `insight-fernwartung-<BUILD_ID>.unsigniert.exe` und `quality-<BUILD_ID>.json` an und druckt alle folgenden Befehle
-   mit eingesetzten Werten (keine Platzhalter, kein Token).
-5. Die gedruckten Blöcke der Reihe nach in **derselben** bash ausführen (Shell bis Schritt 5 offen lassen) oder als
-   Skript mit `bash -euo pipefail`. Jeder Prüf- und Netzbefehl trägt `|| exit 1` bzw. `if …; then …; else exit 1; fi`
-   und bricht damit auch in einer offenen bash **ohne** `set -e` ab (die Shell endet, `aufraeumen` läuft per trap).
+   --repo <owner/repo> > signieren-<BUILD_ID>.sh` – prüft den Build wie die Vorprüfung und quality.json wie der
+   Workflow, legt `insight-fernwartung-<BUILD_ID>.unsigniert.exe` und `quality-<BUILD_ID>.json` an und schreibt alle
+   folgenden Befehle mit eingesetzten Werten (keine Platzhalter, kein Token) in die Datei. Fehler erscheinen auf dem
+   Terminal; die Datei bleibt dann leer.
+5. **Standard: als Skript ausführen** – `bash -euo pipefail signieren-<BUILD_ID>.sh` in der Shell aus Schritt 3. Das
+   Skript wartet in Block 3 auf die Freigabe im Browser. Bricht es ab, bleibt das Terminal offen, und die Meldung samt
+   `ABBRUCH (Exit n)` ist sichtbar. **Interaktiv nur in einer Unter-Shell:** zuerst `bash` eingeben, dann die Blöcke
+   der Reihe nach einfügen (Unter-Shell bis Schritt 5 offen lassen). Ein Abbruch beendet dann nur die Unter-Shell;
+   direkt in der Terminal-Shell würde `exit 1` das Fenster samt Meldung schließen (Block 0 warnt dann mit
+   `WARNUNG: Befehle laufen direkt in der Terminal-Shell`). Jeder Prüf- und Netzbefehl trägt `|| exit 1` bzw.
+   `if …; then …; else exit 1; fi` und bricht damit auch **ohne** `set -e` ab (`aufraeumen` läuft per trap und meldet
+   `ABBRUCH (Exit n)`).
    Block 0 definiert `ablage_kopf` (Token nur per `printf` über stdin an `curl -H @-`, nie als Argument),
    `loeschen_erlaubt` und `aufraeumen` und setzt `trap aufraeumen EXIT`.
    Block 1: `curl … /api/signing/health`, dann `PUT …/<BUILD_ID>/unsigned` (nur bei Erfolg `HOCHGELADEN`) und
@@ -358,21 +364,25 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
    `gh workflow run sign-cockpit.yml … -f sha256=… -f quality_sha256=…` (`GESTARTET` schon vor dem Start).
 7. Block 3: Job `vorpruefung` abwarten; in der Zusammenfassung Build-ID, SHA-256, Größe und `remote_e2e_fps` mit der
    Ausgabe von Schritt 4 vergleichen. Erst dann im Lauf „Review deployments“ → `release-signing` freigeben. Die Lauf-ID
-   bestimmt der gedruckte Block genau **einmal** (`gh run list` gefiltert auf `sign-cockpit.yml`, `workflow_dispatch`,
-   Zweig `main` und den Lauftitel „Installer signieren <BUILD_ID>“, ausgewertet von `vorbereiten.py lauf-id`
-   **ohne** die Läufe aus `VORHER`). Kein oder mehr als ein neuer Treffer bricht ab (`lauf_fehlt`, `lauf_mehrdeutig`);
-   dann den Lauf im Browser prüfen und `LAUF=<id>` selbst setzen, nie „den neuesten“ nehmen.
+   bestimmt der gedruckte Block mit `gh run list`, gefiltert auf `sign-cockpit.yml`, `workflow_dispatch`, Zweig `main`
+   und den Lauftitel „Installer signieren <BUILD_ID>“. Ausgewertet wird das von `vorbereiten.py lauf-id` **ohne** die
+   Läufe aus `VORHER`. GitHub listet neue Läufe verzögert; deshalb gibt es bis zu **6 Versuche** im Abstand von 10 s
+   (höchstens etwa eine Minute). Wiederholt wird nur „noch kein neuer Lauf“ (`lauf_fehlt`, Exit 3). Mehr als ein
+   neuer Treffer (`lauf_mehrdeutig`) oder ein Fehler bricht sofort ab. Ist nach 6 Versuchen kein Lauf da, bricht der
+   Block ebenfalls ab. Dann den Lauf im Browser prüfen und nach „Fortsetzen nach Abbruch“ (Fall A) weitermachen; nie
+   „den neuesten“ nehmen.
 8. Job `signieren` grün: Zusammenfassungen „Nachprüfung bestanden“ (Inhaber, Aussteller „Microsoft ID Verified CS …“,
    Zeitstempel), „Signierten Installer in der Ablage abgelegt“ und „Ablage geprüft“. Bei Rot: Code nachschlagen
    (Tabelle oben/Fehlerbilder), nichts verwenden; `aufraeumen` löscht den eigenen Upload nur, wenn `gh run view` den
    Lauf als fehlgeschlagen/abgebrochen meldet und kein `signed` vorliegt. Scheitert nur `gh run watch` (Netz, Strg-C,
-   Terminal geschlossen), bleibt ein grüner, offener oder nicht abrufbarer Lauf unangetastet; Ergebnis dann mit den
-   Befehlen aus Block 4 laden.
+   Terminal geschlossen), bleibt ein grüner, offener oder nicht abrufbarer Lauf unangetastet; Ergebnis dann nach
+   „Fortsetzen nach Abbruch“ (Fall A) laden.
 9. Block 4: Nachweise per `gh run download … --name signatur-nachweis-<BUILD_ID>` laden und mit
    `vorbereiten.py nachweis-pruefen` binden (Lauf-URL = dieser Lauf, `sha256_unsigniert` = lokal geprüfter Build,
-   Version/Kanal/Vorgänger dieses Starts, Nachweis `gueltig`, kein Trockenlauf, Ablage-Eintrag vorhanden; sonst
+   `qualitaet.sha256` = lokal geprüfte quality.json, Version/Kanal/Vorgänger dieses Starts, Nachweis `gueltig`, kein Trockenlauf, Ablage-Eintrag vorhanden; sonst
    `nachweis_abweichung` bzw. `nachweis_ungueltig`). Dann `GET …/<BUILD_ID>/signed` per curl und
-   `vorbereiten.py ergebnis-pruefen`: Größe und SHA-256 = Signaturbericht, NSIS-Kennung, Build-ID, Signatur vorhanden.
+   `vorbereiten.py ergebnis-pruefen` (bindet den Bericht erneut an beide lokalen SHA-256): Größe und SHA-256 =
+   Signaturbericht, NSIS-Kennung, Build-ID, Signatur vorhanden.
    Erst dann entsteht `insight-fernwartung-<BUILD_ID>.exe`. Danach auf einem Windows-Rechner
    `signtool verify /pa /v insight-fernwartung-<BUILD_ID>.exe` und
    `Get-FileHash -Algorithm SHA256 insight-fernwartung-<BUILD_ID>.exe` = `sha256` in `signatur-nachweis.json`.
@@ -391,6 +401,51 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
     Retention (7 Tage) liegen; signierte Artefakte nicht von Hand löschen. Endete schon der erste `PUT` mit 409 (Build
     existiert bereits), wird nichts gelöscht – mit und ohne `set -e`.
 
+### Fortsetzen nach Abbruch
+
+Gilt für jeden Abbruch nach dem Upload. Der Fortsetzen-Durchgang löscht in der Ablage **nie** etwas: Block 0 setzt
+`HOCHGELADEN=0`, und ohne eigenen `PUT` 201 in diesem Durchgang lässt `aufraeumen` die Ablage unangetastet
+(kein `DELETE`). Ein liegen gebliebener Build verschwindet mit der Retention nach 7 Tagen. Fremde oder schon
+signierte Artefakte werden nie gelöscht oder ersetzt, auch nicht von Hand.
+
+Vorbereitung für beide Fälle:
+
+1. Neue Unter-Shell öffnen (`bash`) und das Token wie in Schritt 3 übernehmen.
+2. `vorbereiten.py` mit **denselben** Dateien und Werten (Version, Kanal, Vorgänger/Erstausrollung) erneut ausführen
+   und in `signieren-<BUILD_ID>.sh` schreiben. Das legt die lokalen Kopien neu an, die `aufraeumen` gelöscht hat, und
+   druckt dieselben Hashes. Andere Werte führen später zu `nachweis_abweichung`.
+3. Block 0 aus der neuen Datei einfügen. Die Blöcke sind an den Kommentaren `# 0)` bis `# 5)` zu erkennen.
+
+**Fall A – Lauf wurde gestartet, aber nicht zu Ende verfolgt.** Beispiele: `lauf_fehlt` nach 6 Versuchen,
+`gh run watch` brach ab (Netz, Strg-C), oder das Fenster wurde geschlossen.
+
+1. Im Browser unter Actions → „Fernwartungs-Installer signieren“ den Lauf mit Titel „Installer signieren
+   <BUILD_ID>“ suchen. Er muss Event `workflow_dispatch` haben und auf `main` laufen. Es muss der Lauf dieses Starts
+   sein, kein älterer derselben Build-ID; im Zweifel nicht fortsetzen.
+2. `LAUF=<Lauf-ID>` setzen.
+3. Ist der Lauf noch offen: `gh run watch --repo <owner/repo> "$LAUF" --exit-status || exit 1`.
+4. Block 4 einfügen, dann Block 5 (`aufraeumen`). Block 4 prüft den Nachweis gegen genau diesen Lauf und beide
+   lokalen SHA-256.
+
+Endete der Lauf rot, bricht Block 4 ab. Der Upload bleibt dann bis zur Retention liegen. Ein neuer Versuch derselben
+Build-ID geht nach Fall B, sonst mit einem neuen Build.
+
+**Fall B – Ausgang des Uploads oder des Starts unbekannt, neuer Durchgang endet mit 409.** Beispiele: Netzfehler beim
+`PUT`, `gh workflow run` scheiterte endgültig, oder der erste `PUT` meldet `storage_konflikt` (HTTP 409).
+
+1. Im Browser prüfen, dass zu dieser Build-ID **kein** Lauf offen ist (wartend, laufend, zur Freigabe) und keiner
+   grün endete. Gibt es einen offenen oder grünen Lauf, weiter mit Fall A.
+2. Statt der `PUT`-Zeilen nur die letzte Zeile von Block 1 einfügen: `… manifest | … manifest-pruefen …`. Sie gelingt
+   nur, wenn die Ablage genau den eigenen, lokal geprüften Installer und Qualitätsnachweis enthält (gleiche SHA-256)
+   und noch kein `signed`.
+3. Meldet sie `quality_fehlt`, kam nur der Installer an. Dann einmal die `PUT …/quality`-Zeile aus Block 1 einfügen
+   und `manifest-pruefen` wiederholen.
+4. Dann Block 2, 3, 4 und 5 einfügen. Block 2 merkt ältere Läufe in `VORHER`, sie werden nie verwendet.
+
+Meldet `manifest-pruefen` `ablage_abweichung`, `signiert_vorhanden` oder `asset_fehlt`, liegt ein fremder,
+abweichender oder schon signierter Stand in der Ablage. Dann nicht starten und nichts löschen. Ein vorhandenes
+Ergebnis über Fall A laden, sonst einen neuen Build erzeugen oder die Retention abwarten.
+
 ## Fehlerbilder der ersten Läufe
 
 | Symptom | Ursache | Abhilfe |
@@ -404,20 +459,21 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
 | `quality_ungueltig` | quality.json nicht bestanden, fremde Build-ID oder ohne `remote_e2e_fps` | Qualitätslauf für genau diesen Build wiederholen |
 | `quality_abweichung` / `eingabe_quality_sha256` | quality.json in der Ablage ≠ lokal geprüfter Nachweis (Eingabe `quality_sha256`), z. B. per `replace=1` ersetzt | nichts signieren; Nachweis prüfen, mit `vorbereiten.py` neu starten |
 | `digest_abweichung` | Erwarteter SHA-256 ≠ Hash in der Ablage (falscher Start oder ausgetauschter Installer) | nichts signieren; Build prüfen, neu hochladen |
-| `signiert_vorhanden` / `storage_konflikt` (HTTP 409) | Build wurde schon signiert bzw. `signed` existiert | vorhandenes Ergebnis verwenden oder neuen Build erzeugen; nie überschreiben |
+| `signiert_vorhanden` / `storage_konflikt` (HTTP 409) | Build wurde schon signiert bzw. `signed` existiert, oder ein früherer Upload desselben Builds liegt noch in der Ablage | vorhandenes Ergebnis verwenden (Fortsetzen, Fall A), eigenen Upload über Fortsetzen, Fall B weiterverwenden oder neuen Build erzeugen; nie überschreiben oder löschen |
 | `upload_digest` / `upload_abweichung` | Ablage liefert andere Bytes oder Hashes als geprüft | nichts verwenden; Betrieb der Ablage prüfen lassen, neuer Lauf |
 | `umgebung_ungeschuetzt` | keine Pflicht-Reviewer eingetragen | Schritt 5; keine Sicherheitsgrenze gegen fremde Workflows |
 | `umgebung_admin_bypass` | Administratoren dürfen die Freigabe umgehen | Schritt 5: Bypass im Portal abwählen |
 | `umgebung_fehlt` mit HTTP 403/404 | Environment fehlt oder Token darf es nicht lesen | Environment anlegen; Workflow-Rechte `actions: read` im Job `vorpruefung` prüfen |
-| `nachweis_abweichung` | Nachweis aus anderem Lauf, anderem Build (SHA-256) oder mit anderen Dispatch-Werten | nichts verwenden; richtigen Lauf prüfen, ggf. neuer Lauf |
+| `nachweis_abweichung` | Nachweis aus anderem Lauf, anderem Build bzw. Qualitätsnachweis (SHA-256) oder mit anderen Dispatch-Werten | nichts verwenden; richtigen Lauf prüfen, ggf. neuer Lauf |
 | `azure/login`: „No matching federated identity record found for presented assertion subject …“ | Subject im Federated Credential passt nicht | genau das in der Meldung genannte Subject eintragen (Schritt 3) |
 | `azure/login`: „No subscriptions found“ | Rollenzuweisung fehlt oder liegt in einem anderen Abonnement | Schritt 3/4 |
 | Signierschritt 403 bzw. `SignerSign()` fehlgeschlagen | Endpunkt passt nicht zur Region oder Rolle fehlt | `ARTIFACT_SIGNING_ENDPOINT` = Account URI; Schritt 4 |
 | `signtool_verify` mit „not trusted“ | Profil vom Typ „Public Trust Test“ oder Private Trust | Public-Trust-Profil verwenden |
 | `herausgeber_abweichung` | `ARTIFACT_SIGNING_PUBLISHER` ≠ Common Name des Zertifikats | Variable auf den gemeldeten Inhaber setzen, wenn er korrekt ist |
 | `aussteller_abweichung` | Zertifikat nicht von Artifact Signing | Konto/Profil prüfen |
-| `lauf_fehlt` / `lauf_mehrdeutig` | neuer Lauf noch nicht gelistet bzw. mehrere neue Läufe mit derselben Build-ID | einige Sekunden warten bzw. Lauf im Browser prüfen und `LAUF=<id>` selbst setzen |
-| `HINWEIS [lauf_offen]` / `[lauf_unbekannt]` / `[lauf_nicht_fehlgeschlagen]` / `[signiert_vorhanden]` / `[fremder_upload]` beim Aufräumen | `loeschen-pruefen` konnte keinen eigenen, fehlgeschlagenen Upload ohne `signed` belegen | gewollt: nichts gelöscht, Retention (7 Tage); Lauf im Browser prüfen, Ergebnis ggf. mit Block 4 laden |
+| `lauf_fehlt` / `lauf_mehrdeutig` | neuer Lauf auch nach 6 Versuchen (≈ 1 min) nicht gelistet bzw. mehrere neue Läufe mit derselben Build-ID | Lauf im Browser prüfen; weiter nach „Fortsetzen nach Abbruch“, Fall A (Block 0 neu, `LAUF=<Lauf-ID>`, Block 4); nie raten |
+| `ABBRUCH (Exit n)` bzw. Terminal schließt sich bei einem Fehler | ein Prüf- oder Netzbefehl brach ab; Befehle liefen direkt in der Terminal-Shell statt als Skript bzw. in einer Unter-Shell | als Skript mit `bash -euo pipefail` oder in einer Unter-Shell (`bash`) ausführen; Meldung über `ABBRUCH` lesen; weiter nach „Fortsetzen nach Abbruch“ |
+| `HINWEIS [lauf_offen]` / `[lauf_unbekannt]` / `[lauf_nicht_fehlgeschlagen]` / `[signiert_vorhanden]` / `[fremder_upload]` beim Aufräumen | `loeschen-pruefen` konnte keinen eigenen, fehlgeschlagenen Upload ohne `signed` belegen | gewollt: nichts gelöscht, Retention (7 Tage); Lauf im Browser prüfen, Ergebnis ggf. nach „Fortsetzen nach Abbruch“, Fall A laden |
 | `sha256_abweichung` beim Laden | Download unvollständig oder verändert | Datei verwerfen, erneut laden |
 
 ## Lokaler Trockenlauf und statische Prüfung (ohne Azure, ohne Netz)

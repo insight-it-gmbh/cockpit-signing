@@ -17,9 +17,11 @@ Hilfs-Unterbefehle für die gedruckten Befehle (lesen nur stdin/Dateien, kein Ne
                                                 stdin: Manifest der Ablage → unsigned + quality wie hochgeladen
     laeufe-vorher <BUILD_ID>                    stdin: gh run list --json … → IDs schon vorhandener Läufe (oder -)
     lauf-id <BUILD_ID> <VORHER>                 stdin: gh run list --json … → genau eine NEUE Lauf-ID
-    nachweis-pruefen <ordner> <repo> <LAUF> <BUILD_ID> <SHA256_UNSIGNIERT> <VERSION> <KANAL> <VORGAENGER_ID|->
-                                                Nachweise = dieser Lauf + Dispatch-Werte + lokaler SHA-256
-    ergebnis-pruefen <download> <bericht> <ziel> <SHA256_UNSIGNIERT>
+                                                (Exit 3 = noch kein neuer Lauf gelistet → später erneut fragen)
+    nachweis-pruefen <ordner> <repo> <LAUF> <BUILD_ID> <SHA256_UNSIGNIERT> <SHA256_QUALITY> <VERSION> <KANAL>
+                     <VORGAENGER_ID|->          Nachweise = dieser Lauf + Dispatch-Werte + lokale SHA-256 (Installer,
+                                                quality.json)
+    ergebnis-pruefen <download> <bericht> <ziel> <SHA256_UNSIGNIERT> <SHA256_QUALITY>
                                                 signierter Installer aus der Ablage → SHA-256/Größe = Bericht → <ziel>
     loeschen-pruefen <BUILD_ID> <SHA256_UNSIGNIERT> <SHA256_QUALITY> <LAUF|-> <LAUF_STAND_JSON|->
                                                 stdin: Manifest der Ablage → Exit 0 nur, wenn der Build nachweislich
@@ -158,10 +160,11 @@ def loeschen_pruefen(manifest, build_id, sha256_unsigniert, sha256_quality, lauf
     return None
 
 
-def pruefe_bericht(bericht, build_id, sha256_unsigniert):
+def pruefe_bericht(bericht, build_id, sha256_unsigniert, sha256_quality):
     """signatur-bericht.json aus dem Nachweis-Artefakt: echter (kein Trockenlauf-)Bericht mit geprüfter Ablage, für genau
-    den lokal geprüften unsignierten Installer (SHA-256 aus vorbereiten)."""
+    den lokal geprüften unsignierten Installer und Qualitätsnachweis (beide SHA-256 aus vorbereiten)."""
     _pruefe_sha(sha256_unsigniert)
+    _pruefe_sha(sha256_quality)
     if build_id is None and isinstance(bericht, dict):
         build_id = bericht.get("build_id")
     _pruefe_build_id(build_id)
@@ -180,6 +183,9 @@ def pruefe_bericht(bericht, build_id, sha256_unsigniert):
     if bericht.get("sha256_unsigniert") != sha256_unsigniert:
         raise sig.SigningError("nachweis_abweichung", "Signaturbericht gehört zu einem anderen unsignierten Installer "
                                                       "(SHA-256 ≠ lokal geprüfter Build) – älterer Lauf derselben Build-ID?")
+    if bericht["qualitaet"].get("sha256") != sha256_quality:
+        raise sig.SigningError("nachweis_abweichung", "Signaturbericht gehört zu einem anderen Qualitätsnachweis "
+                                                      "(SHA-256 quality.json ≠ lokal geprüfter Nachweis)")
     return bericht
 
 
@@ -199,7 +205,7 @@ def nachweis_pruefen(ordner, repo, lauf_id, erwartung):
             raise sig.SigningError("nachweis_fehlt", "%s fehlt im Nachweis-Artefakt" % name)
         dateien[name] = _lies_json(pfad, "nachweis_ungueltig", name)
     release, nachweis, bericht = (dateien[n] for n in sig.NACHWEIS_DATEIEN)
-    pruefe_bericht(bericht, e["build_id"], e.get("sha256"))
+    pruefe_bericht(bericht, e["build_id"], e.get("sha256"), e.get("quality_sha256"))
     lauf_url = bericht.get("lauf_url")
     if not isinstance(lauf_url, str) or not lauf_url or not sig.GIT_SHA_RE.match(str(bericht.get("git_sha"))):
         raise sig.SigningError("nachweis_ungueltig", "Signaturbericht ohne Lauf-URL oder Commit")
@@ -230,10 +236,11 @@ def nachweis_pruefen(ordner, repo, lauf_id, erwartung):
     return bericht
 
 
-def ergebnis_pruefen(download, bericht, ziel, sha256_unsigniert):
-    """Signierten Installer aus der Ablage prüfen: Bericht gehört zum lokal geprüften Build, Größe und SHA-256 =
-    Signaturbericht (= im Lauf geprüfte Ablage), NSIS/Build-ID, Signatur vorhanden. Nur dann <ziel>/<datei> schreiben."""
-    pruefe_bericht(bericht, None, sha256_unsigniert)
+def ergebnis_pruefen(download, bericht, ziel, sha256_unsigniert, sha256_quality):
+    """Signierten Installer aus der Ablage prüfen: Bericht gehört zum lokal geprüften Build und Qualitätsnachweis, Größe
+    und SHA-256 = Signaturbericht (= im Lauf geprüfte Ablage), NSIS/Build-ID, Signatur vorhanden. Nur dann
+    <ziel>/<datei> schreiben."""
+    pruefe_bericht(bericht, None, sha256_unsigniert, sha256_quality)
     name, groesse = bericht["asset"], bericht["groesse_signiert"]
     with open(download, "rb") as fh:
         data = fh.read(sig.MAX_GROESSE + 1)
@@ -325,9 +332,13 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
         "# Geprüft: %s – bestanden, remote_e2e_fps %g, SHA-256 %s" % (quality_name(bid), qualitaet["remote_e2e_fps"], sha_q),
         "# Diese Werte vergleicht die freigebende Person mit der Zusammenfassung der Vorprüfung; der Lauf erhält beide",
         "# SHA-256 als Eingaben (sha256, quality_sha256) und lehnt jede andere Datei in der Ablage ab.",
-        "# Befehle der Reihe nach in EINER bash ausführen (Shell bis Schritt 5 offen lassen) oder als Skript mit",
-        "# bash -euo pipefail. Jeder Prüf- und Netzbefehl endet bei Abweichung mit Exit ≠ 0 und beendet die Shell bzw.",
-        "# das Skript (|| exit 1, auch ohne set -e); aufraeumen läuft dann über trap EXIT.",
+        "# Standard: diese Ausgabe als Datei speichern (Umleitung > signieren-%s.sh) und als Skript ausführen:" % bid,
+        "#     bash -euo pipefail signieren-%s.sh" % bid,
+        "# Interaktiv nur in einer Unter-Shell: zuerst bash eingeben, dann die Blöcke der Reihe nach einfügen (Shell bis",
+        "# Schritt 5 offen lassen). Jeder Prüf- und Netzbefehl endet bei Abweichung mit Exit ≠ 0 und beendet das Skript",
+        "# bzw. die Unter-Shell (|| exit 1, auch ohne set -e); aufraeumen läuft dann über trap EXIT und meldet",
+        "# ABBRUCH mit Exit-Code. Direkt in der Terminal-Shell würde ein Abbruch das Fenster samt Meldung schließen.",
+        "# Fortsetzen nach einem Abbruch: Runbook „Fortsetzen nach Abbruch“ (Block 0 neu, nie von Hand löschen).",
         "# Voraussetzung: SIGNING_STORAGE_TOKEN ist in dieser Shell exportiert (aus dem Passwortmanager; nie in Dateien,",
         "# Verlauf oder Argumenten). Er geht nur per printf (Builtin) über stdin an curl (-H @-).",
         "",
@@ -355,7 +366,10 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
         "  printf '%%s' \"$manifest\" | %s loeschen-pruefen %s %s %s \"${LAUF:--}\" \"$stand\"" % (vb, bid, sha_u, sha_q),
         "}",
         "aufraeumen() {",
+        "  local rc=$?",
         "  trap - EXIT",
+        "  [ \"$rc\" = 0 ] || echo \"ABBRUCH (Exit $rc): Meldung oben beachten; nichts von Hand löschen. Fortsetzen nach "
+        "Abbruch siehe Runbook (Block 0 neu, LAUF setzen, Block 4 bzw. Manifest prüfen)\" >&2",
         "  if [ \"$HOCHGELADEN\" = 1 ] && [ \"$LAUF_OK\" != 1 ] && loeschen_erlaubt; then",
         "    ablage_kopf | %s -X DELETE -H @- %s > /dev/null" % (CURL, build_url)
         + " || echo \"WARNUNG: Build %s nicht aus der Ablage gelöscht – Retention entfernt ihn nach 7 Tagen\" >&2" % bid,
@@ -365,6 +379,9 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
         "  rm -f %s %s %s" % (q(kopie), q(q_kopie), q(roh)),
         "}",
         "trap aufraeumen EXIT",
+        "case $- in *i*) [ \"${SHLVL:-1}\" -gt 1 ] || echo \"WARNUNG: Befehle laufen direkt in der Terminal-Shell – ein "
+        "Abbruch schließt das Fenster samt Meldung. Besser: bash starten (Unter-Shell) und dort neu einfügen oder als "
+        "Skript mit bash -euo pipefail\" >&2;; esac",
         "[ -n \"${SIGNING_STORAGE_TOKEN:-}\" ] || { echo \"FEHLER: SIGNING_STORAGE_TOKEN in dieser Shell exportieren\" >&2; exit 1; }",
         "",
         "# 1) Ablage erreichbar? Dann unsignierten Installer und Qualitätsnachweis hochladen (PUT, kein Überschreiben:",
@@ -385,13 +402,17 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
         "GESTARTET=1",
         "gh workflow run %s --repo %s --ref main %s || exit 1" % (WORKFLOW_DATEI, r, " ".join(felder)),
         "",
-        "# 3) NEUEN Lauf genau einmal bestimmen (Workflow, workflow_dispatch, main, Titel „%s“, nicht in VORHER),\n"
+        "# 3) NEUEN Lauf bestimmen (Workflow, workflow_dispatch, main, Titel „%s“, nicht in VORHER): bis zu 6 Versuche\n"
         % (LAUF_TITEL % bid)
-        + "#    verfolgen und im Environment release-signing freigeben. Kein/mehrere Treffer: Abbruch, LAUF nie raten.\n"
-        "#    Scheitert nur die Beobachtung (watch: Netz, Strg-C, Terminal zu), entscheidet aufraeumen per gh run view – ein grüner,\n"
-        "#    offener oder unbekannter Lauf wird nie gelöscht; Ergebnis dann mit Schritt 4 laden.",
-        "sleep 10",
-        "LAUF=\"$(%s | %s lauf-id %s \"${VORHER:?Läufe vor dem Start nicht bestimmt}\")\" || exit 1" % (liste, vb, bid),
+        + "#    im Abstand von 10 s (GitHub listet neue Läufe verzögert); wiederholt wird nur „noch kein neuer Lauf“\n"
+        "#    (Exit 3), mehrere Treffer oder Fehler brechen sofort ab – LAUF nie raten. Dann verfolgen und im\n"
+        "#    Environment release-signing freigeben. Scheitert nur die Beobachtung (watch: Netz, Strg-C, Terminal zu),\n"
+        "#    entscheidet aufraeumen per gh run view – ein grüner, offener oder unbekannter Lauf wird nie gelöscht.\n"
+        "#    Weiter dann nach Runbook „Fortsetzen nach Abbruch“: Block 0 neu, LAUF=Lauf-ID aus dem Browser, Block 4.",
+        "for VERSUCH in 1 2 3 4 5 6; do sleep 10; if LAUF=\"$(%s | %s lauf-id %s \"${VORHER:?Läufe vor dem Start nicht "
+        "bestimmt}\")\"; then break; else RC=$?; LAUF=; [ \"$RC\" = 3 ] || exit 1; fi; done" % (liste, vb, bid),
+        "[ -n \"$LAUF\" ] || { echo \"FEHLER [lauf_fehlt]: neuer Lauf nach 6 Versuchen nicht gelistet – nicht raten. Lauf im "
+        "Browser prüfen; Fortsetzen: neue Unter-Shell, Block 0 neu, LAUF=Lauf-ID setzen, Block 4 (Runbook)\" >&2; exit 1; }",
         "echo \"Lauf ${LAUF:?Lauf nicht bestimmt}\"",
         "if gh run watch --repo %s \"${LAUF:?Lauf nicht bestimmt}\" --exit-status; then LAUF_OK=1; else exit 1; fi" % r,
         "",
@@ -400,10 +421,10 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
         "mkdir -p %s || exit 1" % q(erg),
         "gh run download --repo %s \"${LAUF:?Lauf nicht bestimmt}\" --name signatur-nachweis-%s --dir %s || exit 1"
         % (r, bid, q(nachweis)),
-        "%s nachweis-pruefen %s %s \"${LAUF:?Lauf nicht bestimmt}\" %s %s %s %s %s || exit 1"
-        % (vb, q(nachweis), repo, bid, sha_u, q(version), kanal, q(vorgaenger_id) if vorgaenger_id else KEINE),
+        "%s nachweis-pruefen %s %s \"${LAUF:?Lauf nicht bestimmt}\" %s %s %s %s %s %s || exit 1"
+        % (vb, q(nachweis), repo, bid, sha_u, sha_q, q(version), kanal, q(vorgaenger_id) if vorgaenger_id else KEINE),
         "ablage_kopf | %s -H @- -o %s \"$ABLAGE/%s/signed\" || exit 1" % (CURL, q(roh), bid),
-        "%s ergebnis-pruefen %s %s %s %s || exit 1" % (vb, q(roh), q(bericht), q(erg), sha_u),
+        "%s ergebnis-pruefen %s %s %s %s %s || exit 1" % (vb, q(roh), q(bericht), q(erg), sha_u, sha_q),
         "",
         "# 5) Aufräumen – IMMER, unabhängig vom Ergebnis (läuft sonst spätestens beim Schließen der Shell): lokale",
         "#    unsignierte Kopie, Qualitätskopie und Download löschen; Ablage siehe Schritt 0.",
@@ -428,7 +449,7 @@ def _menge(text):
     return {_id(t, "lauf_liste", "Lauf-ID (vorher)") for t in text.split(",")}
 
 
-HILFSBEFEHLE = {"manifest-pruefen": 3, "laeufe-vorher": 1, "lauf-id": 2, "nachweis-pruefen": 8, "ergebnis-pruefen": 4,
+HILFSBEFEHLE = {"manifest-pruefen": 3, "laeufe-vorher": 1, "lauf-id": 2, "nachweis-pruefen": 9, "ergebnis-pruefen": 5,
                 "loeschen-pruefen": 5}
 
 
@@ -452,22 +473,22 @@ def hilfsbefehl(argv):
             vorher = _menge(args[1])
             print(lauf_aufloesen(_lies_json(sys.stdin, "lauf_liste", "Antwort von gh run list"), args[0], vorher))
         elif befehl == "nachweis-pruefen":
-            ordner, repo, lauf_id, bid, sha_u, version, kanal, vorgaenger = args
+            ordner, repo, lauf_id, bid, sha_u, sha_q, version, kanal, vorgaenger = args
             if vorgaenger != KEINE and not sig.RELEASE_ID_RE.match(vorgaenger):
                 raise sig.SigningError("eingabe_vorgaenger", "Vorgänger-ID hat kein gültiges Format")
-            erwartung = {"build_id": bid, "sha256": sha_u, "version": version, "kanal": kanal,
+            erwartung = {"build_id": bid, "sha256": sha_u, "quality_sha256": sha_q, "version": version, "kanal": kanal,
                          "vorgaenger_id": None if vorgaenger == KEINE else vorgaenger, "erstausrollung": vorgaenger == KEINE}
             b = nachweis_pruefen(ordner, repo, lauf_id, erwartung)
             print("# Geprüft: Nachweis aus Lauf %s – Build-ID %s, Version %s, Kanal %s, SHA-256 unsigniert %s…, signiert %s…"
                   % (lauf_id, bid, version, kanal, sha_u[:16], b["sha256_signiert"][:16]))
         else:
             bericht = _lies_json(args[1], "nachweis_ungueltig", "signatur-bericht.json")
-            pfad = ergebnis_pruefen(args[0], bericht, args[2], args[3])
+            pfad = ergebnis_pruefen(args[0], bericht, args[2], args[3], args[4])
             print("# Geprüft: %s – SHA-256 %s, %d Bytes, signiert, = Signaturbericht"
                   % (pfad, bericht["sha256_signiert"], bericht["groesse_signiert"]))
     except sig.SigningError as exc:
         print("FEHLER [%s]: %s" % (exc.code, exc.meldung), file=sys.stderr)
-        return 1
+        return 3 if (befehl, exc.code) == ("lauf-id", "lauf_fehlt") else 1   # nur „noch nicht gelistet“ ist wiederholbar
     except OSError as exc:
         print("FEHLER [datei_fehlt]: %s" % exc.__class__.__name__, file=sys.stderr)
         return 1

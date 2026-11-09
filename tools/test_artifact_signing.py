@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -1026,12 +1027,14 @@ class Trockenlauf(unittest.TestCase):
         lauf = self.laeufe["erfolg"]
         ordner = lauf.jobs["signieren"]["ausgaben"]["nachpruefen"]["nachweis_ordner"]
         bericht = tl.lies_json(os.path.join(ordner, "signatur-bericht.json"))
+        sha_q = hashlib.sha256(lauf.quality).hexdigest()
         erwartung = {"build_id": BID, "sha256": lauf.sha256, "version": tl.EINGABEN["version"], "kanal": "pilot",
-                     "vorgaenger_id": None, "erstausrollung": True}
+                     "vorgaenger_id": None, "erstausrollung": True, "quality_sha256": sha_q}
         self.assertEqual(code_von(vb.nachweis_pruefen, ordner, tl.REPO_NAME, "4711", erwartung), "nachweis_ungueltig")
-        self.assertEqual(code_von(vb.pruefe_bericht, bericht, BID, lauf.sha256), "nachweis_ungueltig")
+        self.assertEqual(code_von(vb.pruefe_bericht, bericht, BID, lauf.sha256, sha_q), "nachweis_ungueltig")
         echt = dict(bericht, trockenlauf=False)
-        self.assertEqual(vb.pruefe_bericht(echt, BID, lauf.sha256)["ablage"]["sha256"], bericht["sha256_signiert"])
+        self.assertEqual(vb.pruefe_bericht(echt, BID, lauf.sha256, sha_q)["ablage"]["sha256"], bericht["sha256_signiert"])
+        self.assertEqual(code_von(vb.pruefe_bericht, echt, BID, lauf.sha256, "d" * 64), "nachweis_abweichung")
 
 
 REPO_BSP = "beispiel/cockpit-signing"
@@ -1154,7 +1157,20 @@ def pruefe_befehle(test, befehle, repo):
                      "databaseId,displayTitle,event,headBranch,workflowName"):
             test.assertIn(teil, liste)
     test.assertTrue(listen[0].startswith("VORHER=\"$(") and "laeufe-vorher %s" % BID in listen[0], listen[0])
-    test.assertTrue(listen[1].startswith("LAUF=\"$(") and "lauf-id %s \"${VORHER:?" % BID in listen[1], listen[1])
+    # M2: neue Lauf-ID bis zu 6× mit je 10 s Pause suchen – nur lauf_fehlt (Exit 3) wird wiederholt, alles andere bricht
+    # sofort ab; nie raten
+    test.assertTrue(listen[1].startswith("for VERSUCH in 1 2 3 4 5 6; do sleep 10; if LAUF=\"$(") and
+                    "lauf-id %s \"${VORHER:?" % BID in listen[1], listen[1])
+    test.assertTrue(listen[1].endswith("then break; else RC=$?; LAUF=; [ \"$RC\" = 3 ] || exit 1; fi; done"), listen[1])
+    nach_schleife = zeilen[zeilen.index(listen[1]) + 1]
+    test.assertTrue(nach_schleife.startswith("[ -n \"$LAUF\" ] || {") and "Block 0" in nach_schleife
+                    and "Block 4" in nach_schleife, nach_schleife)
+    # M1: Skriptmodus ist Standard, interaktiv nur in einer Unter-Shell; Warnung in der Terminal-Shell; Abbruchmeldung
+    kopf = befehle[:befehle.index("ABLAGE=")]
+    test.assertIn("bash -euo pipefail signieren-%s.sh" % BID, kopf)
+    test.assertIn("Unter-Shell", kopf)
+    test.assertIn("ABBRUCH (Exit $rc)", befehle)
+    test.assertIn("case $- in *i*)", befehle)
     reihenfolge = ["trap aufraeumen EXIT", "/api/signing/health", "/unsigned\"", "HOCHGELADEN=1", "/quality\"",
                    "manifest-pruefen", "laeufe-vorher", "GESTARTET=1", "gh workflow run", "lauf-id", "gh run watch",
                    "LAUF_OK=1",
@@ -1162,6 +1178,15 @@ def pruefe_befehle(test, befehle, repo):
     positionen = [befehle.index(t, befehle.index("trap aufraeumen EXIT")) for t in reihenfolge]
     test.assertEqual(positionen, sorted(positionen), reihenfolge)
     test.assertEqual(zeilen[-1], "aufraeumen")
+    # M4: lokale Nachweis- und Ergebnisprüfung binden auch den lokal geprüften quality-Hash
+    sha_u = re.search(r"-f sha256=([0-9a-f]{64})", befehle).group(1)
+    sha_q = re.search(r"-f quality_sha256=([0-9a-f]{64})", befehle).group(1)
+    nw = [z for z in zeilen if " nachweis-pruefen " in z]
+    test.assertEqual(len(nw), 1, nw)
+    test.assertIn(" %s %s %s " % (BID, sha_u, sha_q), nw[0])
+    erg = [z for z in zeilen if " ergebnis-pruefen " in z]
+    test.assertEqual(len(erg), 1, erg)
+    test.assertTrue(erg[0].endswith(" %s %s || exit 1" % (sha_u, sha_q)), erg[0])
     kopf = [z for z in befehle.splitlines() if z.startswith("# ") and "Aufräumen" in z]
     test.assertEqual(len(kopf), 1, kopf)
     test.assertIn("IMMER", kopf[0])
@@ -1181,7 +1206,10 @@ def pruefe_befehle(test, befehle, repo):
     # jeder Prüf-/Netzbefehl nach Block 0 bricht auch ohne set -e ab
     rumpf = zeilen[zeilen.index("trap aufraeumen EXIT") + 1:-1]
     for z in rumpf:
-        if z.startswith(("echo ", "GESTARTET=", "sleep ")):
+        if z.startswith(("echo ", "GESTARTET=", "sleep ", "case $- in *i*) ")):
+            continue
+        if z.startswith("for VERSUCH in "):
+            test.assertTrue(z.endswith("|| exit 1; fi; done"), z)
             continue
         test.assertTrue(z.endswith(("|| exit 1", "; exit 1; }", "; else exit 1; fi")), z)
 
@@ -1194,7 +1222,8 @@ def lauf(nummer, build_id=BID, **aenderung):
 
 
 ERWARTUNG = {"build_id": BID, "sha256": hashlib.sha256(tl.baue_installer()).hexdigest(), "version": "2026.11.1",
-             "kanal": "pilot", "vorgaenger_id": None, "erstausrollung": True}
+             "kanal": "pilot", "vorgaenger_id": None, "erstausrollung": True,
+             "quality_sha256": hashlib.sha256(tl.quality_bytes()).hexdigest()}
 
 
 def signiertes_ergebnis():
@@ -1333,7 +1362,13 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
                     (nachweis_dateien(bericht, release={"artefakte": [{"name": bericht["asset"], "sha256": "e" * 64,
                                                                         "groesse": 1}]}), "4711", ERWARTUNG),
                     (nachweis_dateien(bericht), "4711", dict(ERWARTUNG, version="2026.11.2")),
-                    (nachweis_dateien(alt_bericht), "4711", ERWARTUNG)],
+                    (nachweis_dateien(alt_bericht), "4711", ERWARTUNG),
+                    # M4: Bericht eines anderen Qualitätsnachweises bzw. ohne quality-Hash → nie akzeptieren
+                    (nachweis_dateien(dict(bericht, qualitaet=dict(bericht["qualitaet"], sha256="d" * 64))), "4711",
+                     ERWARTUNG),
+                    (nachweis_dateien(dict(bericht, qualitaet={k: v for k, v in bericht["qualitaet"].items()
+                                                               if k != "sha256"})), "4711", ERWARTUNG),
+                    (nachweis_dateien(bericht), "4711", dict(ERWARTUNG, quality_sha256="d" * 64))],
                 "nachweis_ungueltig": [
                     (nachweis_dateien(bericht, nachweis={"status": "ungueltig"}), "4711", ERWARTUNG),
                     (nachweis_dateien(dict(bericht, trockenlauf=True)), "4711", ERWARTUNG),
@@ -1348,6 +1383,8 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
                 for dateien, lauf_id, erwartung in varianten:
                     with self.subTest(code=code, lauf=lauf_id):
                         self.assertEqual(code_von(pruefe, dateien, lauf_id, erwartung), code)
+            ohne_q = {k: v for k, v in ERWARTUNG.items() if k != "quality_sha256"}
+            self.assertEqual(code_von(pruefe, nachweis_dateien(bericht), "4711", ohne_q), "eingabe_sha256")
             unvollstaendig = nachweis_dateien(bericht)
             del unvollstaendig["release-metadata.json"]
             self.assertEqual(code_von(pruefe, unvollstaendig), "nachweis_fehlt")
@@ -1362,14 +1399,14 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
 
     def test_ergebnis_pruefen(self):
         signiert, bericht = signiertes_ergebnis()
-        sha_u = bericht["sha256_unsigniert"]
+        sha_u, sha_q = bericht["sha256_unsigniert"], bericht["qualitaet"]["sha256"]
         tmp = tempfile.mkdtemp(prefix="Insight Ergebnis ")
         try:
-            def lade(inhalt, ziel=os.path.join(tmp, "Ausgang (signiert)"), erwartet_u=sha_u):
+            def lade(inhalt, ziel=os.path.join(tmp, "Ausgang (signiert)"), erwartet_u=sha_u, erwartet_q=sha_q):
                 roh = os.path.join(tmp, "download.bin")
                 with open(roh, "wb") as fh:
                     fh.write(inhalt)
-                return vb.ergebnis_pruefen(roh, bericht, ziel, erwartet_u)
+                return vb.ergebnis_pruefen(roh, bericht, ziel, erwartet_u, erwartet_q)
 
             pfad = lade(signiert)
             self.assertEqual(os.path.basename(pfad), sig.asset_name(BID))
@@ -1387,13 +1424,14 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
             with open(pfad, "rb") as fh:
                 self.assertEqual(fh.read(), b"alt")
             self.assertEqual(code_von(lade, signiert, erwartet_u="d" * 64), "nachweis_abweichung")
+            self.assertEqual(code_von(lade, signiert, erwartet_q="d" * 64), "nachweis_abweichung")
             unsigniert = tl.baue_installer()
             ohne_sig = dict(bericht, sha256_signiert=hashlib.sha256(unsigniert).hexdigest(), groesse_signiert=len(unsigniert))
             ohne_sig["ablage"] = dict(bericht["ablage"], sha256=ohne_sig["sha256_signiert"], groesse=len(unsigniert))
             roh = os.path.join(tmp, "u.bin")
             with open(roh, "wb") as fh:
                 fh.write(unsigniert)
-            self.assertEqual(code_von(vb.ergebnis_pruefen, roh, ohne_sig, tmp, sha_u), "signatur_fehlt")
+            self.assertEqual(code_von(vb.ergebnis_pruefen, roh, ohne_sig, tmp, sha_u, sha_q), "signatur_fehlt")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1508,14 +1546,44 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
             self.assertEqual(ablage.inhalt(BID, "signed"), vorher)
             aufgeraeumt(kopie)
 
-            # Race: Lauf gestartet, aber nicht bestimmbar → Ausgang unbekannt → nichts löschen (Retention)
+            # Race: Lauf gestartet, aber auch nach 6 Versuchen nicht bestimmbar → Ausgang unbekannt → nichts löschen
             p, kopie, aufrufe, ablage = ausfuehren(laeufe_folge=[[lauf(4700)], [lauf(4700)]])
             self.assertNotEqual(p.returncode, 0)
             self.assertIn("lauf_fehlt", p.stderr)
+            self.assertEqual(sum(a[:2] == ["run", "list"] for a in aufrufe), 1 + 6)
+            self.assertIn("Block 0", p.stderr)
+            self.assertIn("ABBRUCH (Exit 1)", p.stderr)
             self.assertFalse([a for a in aufrufe if a[:2] in (["run", "watch"], ["run", "download"])])
             self.assertFalse([a for a in ablage_anfragen(ablage) if a[0] == "DELETE"])
             self.assertIsNotNone(ablage.inhalt(BID, "unsigned"))
             self.assertIn("nicht von Hand löschen", p.stderr)
+            aufgeraeumt(kopie)
+
+            # GitHub listet den neuen Lauf erst beim 3. Versuch → wird gefunden, Erfolg ohne Raten
+            p, kopie, aufrufe, ablage = ausfuehren(laeufe_folge=[[lauf(4700)], [lauf(4700)], [lauf(4700)],
+                                                                 [lauf(4711), lauf(4700)]])
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertEqual(sum(a[:2] == ["run", "list"] for a in aufrufe), 1 + 3)
+            self.assertNotIn("ABBRUCH", p.stderr)
+            self.assertTrue(os.path.exists(ergebnis))
+            os.remove(ergebnis)
+            aufgeraeumt(kopie)
+
+            # Mehrdeutig → sofort Abbruch (keine Wiederholung), nichts löschen
+            p, kopie, aufrufe, ablage = ausfuehren(laeufe_folge=[[], [lauf(4711), lauf(4712)]])
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("lauf_mehrdeutig", p.stderr)
+            self.assertEqual(sum(a[:2] == ["run", "list"] for a in aufrufe), 2)
+            self.assertFalse([a for a in ablage_anfragen(ablage) if a[0] == "DELETE"])
+            aufgeraeumt(kopie)
+
+            # M4: Bericht mit fremdem quality-Hash → nachweis_abweichung vor dem Download, keine Löschung
+            manip = dict(bericht, qualitaet=dict(bericht["qualitaet"], sha256="e" * 64))
+            p, kopie, aufrufe, ablage = ausfuehren(nachweise={"4711": nachweis_dateien(manip)})
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("nachweis_abweichung", p.stderr)
+            self.assertFalse([a for a in ablage_anfragen(ablage) if a[0] == "DELETE" or a[1] == "signed"])
+            self.assertFalse(os.path.exists(ergebnis))
             aufgeraeumt(kopie)
 
             # Roter Lauf (gh run view: completed/failure), kein signed → eigener Upload gelöscht, kein Download
@@ -1674,6 +1742,137 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
                 with self.subTest(code=code, lauf=lauf_id, stand=stand):
                     self.assertEqual(code_von(vb.loeschen_pruefen, m, BID, sha, sha_q, lauf_id, stand), code)
 
+    def test_fortsetzen_nach_abbruch_und_interaktiver_modus(self):
+        """M1–M3: Runbook-Pfade „Fortsetzen nach Abbruch“ als echte bash-Läufe: (A) Lauf-ID fehlte bzw. Beobachtung
+        abgebrochen → Block 0 neu, LAUF setzen, Block 4; (B) unbekannter Upload-Ausgang/409 → Block 0, Manifest prüfen,
+        Blöcke 2–5. Beide löschen nie (HOCHGELADEN bleibt 0), fremde Artefakte bleiben unangetastet. Interaktiv: Warnung
+        in der Terminal-Shell, klare Abbruchmeldung."""
+        signiert, bericht = signiertes_ergebnis()
+        tmp = tempfile.mkdtemp(prefix="Insight Fortsetzen ")
+        try:
+            quelle, q = lege_quelle(tmp)
+            ziel = os.path.join(tmp, "Ausgang")
+            installer = os.path.join(tmp, "signiert.bin")
+            with open(installer, "wb") as fh:
+                fh.write(signiert)
+            ergebnis = os.path.join(ziel, "signiert-%s" % BID, sig.asset_name(BID))
+            basis = {"build_id": BID, "lauf": "4711", "installer": installer, "signieren": True,
+                     "nachweise": {"4711": nachweis_dateien(bericht)}, "laeufe_folge": [[], [lauf(4711)]]}
+            ablage_ordner = os.path.join(tmp, "Ablage")
+
+            def neue_ablage(vorbelegt=None):
+                shutil.rmtree(ablage_ordner, ignore_errors=True)
+                ablage = fake_storage.FakeAblage.einrichten(ablage_ordner, TOKEN_TEST)
+                for kind, daten in (vorbelegt or {}).items():
+                    ablage.roh_ablegen(BID, kind, daten)
+                return ablage
+
+            def bloecke():
+                _e, _k, befehle = vb.vorbereiten(quelle, q, "2026.11.1", "pilot", None, True, ziel, REPO_BSP)
+                teile, nr = {}, None
+                for z in befehle.splitlines():
+                    m = re.match(r"# ([0-5])\) ", z)
+                    if m:
+                        nr = int(m.group(1))
+                    if nr is not None:
+                        teile.setdefault(nr, []).append(z)
+                return befehle, {k: "\n".join(v) for k, v in teile.items()}
+
+            def lauf_bash(skript, flags=("-euo", "pipefail"), **aenderung):
+                if os.path.exists(ergebnis):
+                    os.remove(ergebnis)
+                ablage = fake_storage.FakeAblage(ablage_ordner)
+                vorher = len(ablage.protokoll())
+                env = self.umgebung(tmp, dict(basis, **aenderung))
+                p = subprocess.run(["bash", *flags, "-c", skript], capture_output=True, text=True, env=env, timeout=120)
+                anfragen = [(a["methode"], a["pfad"].rsplit("/", 1)[-1], a["status"])
+                            for a in ablage.protokoll()[vorher:] if a["quelle"] == "curl"]
+                return p, anfragen, self.gh_aufrufe(tmp)
+
+            # (A) Erster Durchgang: Lauf gestartet, Lauf-ID auch nach 6 Versuchen nicht gelistet → Abbruch, nichts gelöscht
+            ablage = neue_ablage()
+            befehle, b = bloecke()
+            p, anfragen, aufrufe = lauf_bash(befehle, laeufe_folge=[[], []], signieren=False)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("lauf_fehlt", p.stderr)
+            self.assertFalse([a for a in anfragen if a[0] == "DELETE"])
+            # … der Lauf läuft in GitHub weiter und legt signed ab. Fortsetzen: Block 0 neu, LAUF setzen, Block 4, Block 5
+            ablage.roh_ablegen(BID, "signed", signiert)
+            _befehle, b = bloecke()
+            fortsetzen_a = "\n".join([b[0], "LAUF=4711", b[4], b[5]])
+            p, anfragen, aufrufe = lauf_bash(fortsetzen_a)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertTrue(os.path.exists(ergebnis))
+            self.assertFalse([a for a in anfragen if a[0] in ("DELETE", "PUT")], anfragen)
+            self.assertFalse([a for a in aufrufe if a[:2] in (["workflow", "run"], ["run", "list"])])
+            for kind in ("unsigned", "quality", "signed"):
+                self.assertIsNotNone(ablage.inhalt(BID, kind), kind)      # bleibt bis zur Retention
+            # Fortsetzen, aber der Lauf war rot (kein Nachweis) → Abbruch; trotzdem keine Löschung (HOCHGELADEN=0)
+            p, anfragen, aufrufe = lauf_bash(fortsetzen_a, nachweise={})
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("ABBRUCH (Exit 1)", p.stderr)
+            self.assertFalse([a for a in anfragen if a[0] == "DELETE"])
+            self.assertFalse(os.path.exists(ergebnis))
+
+            # (B) Unbekannter Upload-Ausgang: eigener Upload liegt schon in der Ablage → neuer Durchgang endet mit 409
+            eigen = {"unsigned": tl.baue_installer(), "quality": tl.quality_bytes()}
+            ablage = neue_ablage(eigen)
+            befehle, b = bloecke()
+            p, anfragen, aufrufe = lauf_bash(befehle)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertIn("409", p.stderr)
+            self.assertFalse([a for a in anfragen if a[0] == "DELETE"])
+            block1 = b[1].splitlines()
+            manifest_zeile = [z for z in block1 if "manifest-pruefen" in z]
+            quality_zeile = [z for z in block1 if "/quality\"" in z]
+            self.assertEqual((len(manifest_zeile), len(quality_zeile)), (1, 1))
+            fortsetzen_b = "\n".join([b[0]] + manifest_zeile + [b[2], b[3], b[4], b[5]])
+            p, anfragen, aufrufe = lauf_bash(fortsetzen_b)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertTrue(os.path.exists(ergebnis))
+            self.assertFalse([a for a in anfragen if a[0] in ("DELETE", "PUT")], anfragen)
+            self.assertEqual(sum(a[:2] == ["workflow", "run"] for a in aufrufe), 1)
+            # dasselbe, aber der Lauf endet rot → trotzdem nichts gelöscht (kein eigener PUT in diesem Durchgang)
+            ablage = neue_ablage(eigen)
+            p, anfragen, aufrufe = lauf_bash(fortsetzen_b, lauf_gruen=False, signieren=False)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertFalse([a for a in anfragen if a[0] == "DELETE"])
+            self.assertEqual(ablage.inhalt(BID, "unsigned"), eigen["unsigned"])
+            # nur unsigned kam an (quality-PUT scheiterte): quality-PUT allein nachholen, dann Manifest, Blöcke 2–5
+            ablage = neue_ablage({"unsigned": eigen["unsigned"]})
+            p, anfragen, aufrufe = lauf_bash("\n".join([b[0]] + manifest_zeile))
+            self.assertIn("quality_fehlt", p.stderr)
+            _befehle, b = bloecke()          # aufraeumen hat die lokalen Kopien gelöscht → vorbereiten.py erneut
+            p, anfragen, aufrufe = lauf_bash("\n".join([b[0]] + quality_zeile + manifest_zeile + [b[2], b[3], b[4], b[5]]))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertEqual([a for a in anfragen if a[0] in ("PUT", "DELETE")], [("PUT", "quality", 201)])
+            # fremder bzw. schon signierter Build → Fortsetzen endet am Manifest: kein Start, nichts gelöscht/verändert
+            for name, vorbelegt in (("fremd", {"unsigned": tl.baue_installer(saat=99), "quality": tl.quality_bytes()}),
+                                    ("signiert", dict(eigen, signed=signiert))):
+                with self.subTest(fall=name):
+                    ablage = neue_ablage(vorbelegt)
+                    p, anfragen, aufrufe = lauf_bash(fortsetzen_b)
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertFalse([a for a in aufrufe if a[:2] == ["workflow", "run"]])
+                    self.assertFalse([a for a in anfragen if a[0] in ("DELETE", "PUT")])
+                    for kind, daten in vorbelegt.items():
+                        self.assertEqual(ablage.inhalt(BID, kind), daten, kind)
+
+            # M1: interaktiv direkt in der Terminal-Shell (SHLVL 1) → deutliche Warnung; in einer Unter-Shell nicht.
+            # Abbruch (hier 409) meldet sich klar, statt kommentarlos zu enden.
+            for shlvl, warnung in (("0", True), ("1", False)):
+                with self.subTest(shlvl=shlvl):
+                    neue_ablage(eigen)
+                    env = dict(self.umgebung(tmp, basis), SHLVL=shlvl)
+                    p = subprocess.run(["bash", "--norc", "--noprofile", "-i", "-s"], input=befehle, capture_output=True,
+                                       text=True, env=env, timeout=120)
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertEqual("WARNUNG: Befehle laufen direkt in der Terminal-Shell" in p.stderr, warnung, p.stderr)
+                    self.assertIn("ABBRUCH (Exit 1)", p.stderr)
+                    self.assertIn("Fortsetzen nach Abbruch", p.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_curl_double_lehnt_token_als_argument_ab(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_storage.FakeAblage.einrichten(tmp, TOKEN_TEST)
@@ -1696,8 +1895,11 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
         p = cli("lauf-id", BID, "-", eingabe=json.dumps([lauf(5, build_id="20261109-120001"), lauf(4711)]))
         self.assertEqual((p.returncode, p.stdout.strip()), (0, "4711"), p.stderr)
         p = cli("lauf-id", BID, "4700,4711", eingabe=json.dumps([lauf(4711), lauf(4700)]))
-        self.assertEqual((p.returncode, p.stdout), (1, ""))
+        self.assertEqual((p.returncode, p.stdout), (3, ""))            # nur lauf_fehlt: Exit 3 = später erneut suchen
         self.assertIn("lauf_fehlt", p.stderr)
+        p = cli("lauf-id", BID, "-", eingabe=json.dumps([lauf(4711), lauf(4712)]))
+        self.assertEqual((p.returncode, p.stdout), (1, ""))            # mehrdeutig: kein Wiederholen
+        self.assertIn("lauf_mehrdeutig", p.stderr)
         p = cli("lauf-id", BID, "4700;rm", eingabe="[]")
         self.assertEqual((p.returncode, p.stdout), (1, ""))
         self.assertIn("lauf_liste", p.stderr)
@@ -1738,11 +1940,24 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
         tmp = tempfile.mkdtemp(prefix="Insight CLI ")
         try:
             ordner = schreibe_nachweis(os.path.join(tmp, "nachweis"), nachweis_dateien(bericht))
-            p = cli("nachweis-pruefen", ordner, REPO_BSP, "4711", BID, ERWARTUNG["sha256"], "2026.11.1", "pilot", "-")
+            sha_u, sha_q = ERWARTUNG["sha256"], ERWARTUNG["quality_sha256"]
+            p = cli("nachweis-pruefen", ordner, REPO_BSP, "4711", BID, sha_u, sha_q, "2026.11.1", "pilot", "-")
             self.assertEqual(p.returncode, 0, p.stderr)
-            p = cli("nachweis-pruefen", ordner, REPO_BSP, "4711", BID, ERWARTUNG["sha256"], "2026.11.1", "produktiv", "-")
+            p = cli("nachweis-pruefen", ordner, REPO_BSP, "4711", BID, sha_u, sha_q, "2026.11.1", "produktiv", "-")
             self.assertEqual(p.returncode, 1)
             self.assertIn("nachweis_abweichung", p.stderr)
+            p = cli("nachweis-pruefen", ordner, REPO_BSP, "4711", BID, sha_u, "d" * 64, "2026.11.1", "pilot", "-")
+            self.assertEqual((p.returncode, p.stdout), (1, ""))
+            self.assertIn("nachweis_abweichung", p.stderr)
+            p = cli("nachweis-pruefen", ordner, REPO_BSP, "4711", BID, sha_u, "2026.11.1", "pilot", "-")
+            self.assertEqual((p.returncode, p.stdout), (2, ""))
+            # manipulierter quality-Hash im Bericht (Datei auf der Platte) → Abbruch
+            manipuliert = nachweis_dateien(dict(bericht, qualitaet=dict(bericht["qualitaet"], sha256="e" * 64)))
+            ordner2 = schreibe_nachweis(os.path.join(tmp, "manipuliert"), manipuliert)
+            p = cli("nachweis-pruefen", ordner2, REPO_BSP, "4711", BID, sha_u, sha_q, "2026.11.1", "pilot", "-")
+            self.assertEqual(p.returncode, 1)
+            self.assertIn("nachweis_abweichung", p.stderr)
+            self.assertIn("Qualitätsnachweis", p.stderr)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1779,12 +1994,19 @@ class RunbookUndOeffentlichkeit(unittest.TestCase):
                      "NuGet", "umgebung_admin_bypass", "keine Sicherheitsgrenze", "job_workflow_ref",
                      "sign-cockpit.yml@refs/heads/main", "\"include_claim_keys\"", "nachweis-pruefen",
                      "nachweis_abweichung", "laeufe-vorher", "manifest-pruefen", "ergebnis-pruefen", ".unsigniert.exe",
-                     "trap aufraeumen EXIT", "Schreibrecht", "-H @-", "gh secret set SIGNING_STORAGE_TOKEN"):
+                     "trap aufraeumen EXIT", "Schreibrecht", "-H @-", "gh secret set SIGNING_STORAGE_TOKEN",
+                     "bash -euo pipefail signieren-<BUILD_ID>.sh", "Unter-Shell", "ABBRUCH (Exit",
+                     "### Fortsetzen nach Abbruch", "LAUF=<Lauf-ID>", "6 Versuche"):
             self.assertTrue(text in doku, text)
         einrichtung = doku[doku.index("### 3. Azure OIDC"):doku.index("## Erste Produktivprobe")]
         self.assertIn("Schritt 0.1", einrichtung)
         produktivprobe = doku[doku.index("## Erste Produktivprobe"):doku.index("## Fehlerbilder")]
         self.assertNotIn("gh release", produktivprobe)
+        fortsetzen = doku[doku.index("### Fortsetzen nach Abbruch"):doku.index("## Fehlerbilder")]
+        for text in ("Block 0", "Block 4", "LAUF=<Lauf-ID>", "manifest-pruefen", "409", "HOCHGELADEN", "Retention",
+                     "nie", "fremd", "Unter-Shell", "quality_fehlt"):
+            self.assertIn(text, fortsetzen)
+        self.assertNotIn("DELETE", fortsetzen.replace("kein `DELETE`", ""))
         self.assertNotIn("--testbuild", doku)
         self.assertNotIn("--limit 1", doku)
         for code in ("digest_abweichung", "build_id_abweichung", "signatur_fehlt", "selbstsigniert", "zeitstempel_fehlt",
