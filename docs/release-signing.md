@@ -460,6 +460,8 @@ Ergebnis über Fall A laden, sonst einen neuen Build erzeugen oder die Retention
 | `quality_abweichung` / `eingabe_quality_sha256` | quality.json in der Ablage ≠ lokal geprüfter Nachweis (Eingabe `quality_sha256`), z. B. per `replace=1` ersetzt | nichts signieren; Nachweis prüfen, mit `vorbereiten.py` neu starten |
 | `digest_abweichung` | Erwarteter SHA-256 ≠ Hash in der Ablage (falscher Start oder ausgetauschter Installer) | nichts signieren; Build prüfen, neu hochladen |
 | `signiert_vorhanden` / `storage_konflikt` (HTTP 409) | Build wurde schon signiert bzw. `signed` existiert, oder ein früherer Upload desselben Builds liegt noch in der Ablage | vorhandenes Ergebnis verwenden (Fortsetzen, Fall A), eigenen Upload über Fortsetzen, Fall B weiterverwenden oder neuen Build erzeugen; nie überschreiben oder löschen |
+| `inkonsistent` (HTTP 409 bei GET/manifest) | Datei und gespeicherter Hash widersprechen sich; die Ablage verweigert die Ausgabe statt falscher Bytes | `?replace=1` mit der korrekten Datei und Hash reparieren; nie mit veraltetem Hash weiterarbeiten |
+| `meta_ungueltig` (HTTP 422) | Metadaten enthalten ungültigen Zeitstempel oder ungültige Qualitätswerte | mit korrekter Datei und Metadaten ersetzen; keine Client-Ausnahme einbauen |
 | `upload_digest` / `upload_abweichung` | Ablage liefert andere Bytes oder Hashes als geprüft | nichts verwenden; Betrieb der Ablage prüfen lassen, neuer Lauf |
 | `umgebung_ungeschuetzt` | keine Pflicht-Reviewer eingetragen | Schritt 5; keine Sicherheitsgrenze gegen fremde Workflows |
 | `umgebung_admin_bypass` | Administratoren dürfen die Freigabe umgehen | Schritt 5: Bypass im Portal abwählen |
