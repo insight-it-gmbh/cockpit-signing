@@ -1,0 +1,267 @@
+# Fernwartungs-Installer (NSIS) mit Microsoft Artifact Signing signieren - manueller, freigabepflichtiger Releasepfad.
+#
+# Ablauf (Einrichtung und erste Produktivprobe: docs/release-signing.md)
+#   1. tests        Tests dieses Repositorys (Unit, Mutationen, Trockenlauf) und statische Workflow-Pruefung.
+#   2. vorpruefung  Repository an GITHUB_REPOSITORY gebunden (oeffentlich erlaubt: Installer liegen nie in GitHub).
+#                   Environment-Schutz pruefen (Pflicht-Reviewer, kein Admin-Bypass, nur Zweig main; actions: read
+#                   nur dafuer). Qualitaetsnachweis quality.json aus der privaten Ablage (bestanden=true, Build-ID,
+#                   remote_e2e_fps). Unsignierten Installer aus der Ablage laden (Manifest, Groesse, SHA-256) und
+#                   pruefen: Build-ID der Versionsressource, NSIS-Kennung, Hersteller, noch unsigniert. Ohne Azure.
+#   3. signieren    Erst nach 1 und 2 und nach manueller Freigabe im Environment "release-signing": Qualitaet und
+#                   Installer erneut laden und pruefen (gleicher erwarteter SHA-256), OIDC-Anmeldung, Artifact
+#                   Signing, Azure-Sitzung beenden, signtool verify /pa /tw /v, Inhalt unveraendert, Herausgeber,
+#                   Zeitstempel. Signierten Installer per PUT in die Ablage, erneut laden, Hash pruefen. Nachweise
+#                   (nur JSON, keine Installer) als GitHub-Artefakt. Jede Abweichung bricht ab.
+#
+# Sicherheitsmodell
+#   - Nur workflow_dispatch; kein Tag-, Push- oder Pull-Request-Trigger. Environment-Regel: nur Zweig main.
+#     Die Environment-Pruefung schuetzt nur diesen Workflow; die Grenze gegen fremde Workflows ist das Federated
+#     Credential (Subject) plus Branch-Schutz - siehe docs/release-signing.md.
+#   - Transport ausschliesslich ueber die private Ablage https://cockpit.insight-it.de/api/signing/artifacts mit
+#     Bearer-Token aus dem Repo-Secret SIGNING_STORAGE_TOKEN. Das Secret steht nur im env der Ablage-Schritte (eigene
+#     Helfer, Standardbibliothek), nie in Actions, Job-env oder run-Text. Kein Release, kein Installer-Artefakt.
+#   - Werkzeug-Ueberschreibungen (SIGN_GH, SIGN_SIGNTOOL, SIGN_TROCKENLAUF, SIGN_STORAGE_FAKE) auf jedem GitHub-Runner
+#     verboten.
+#   - Azure-Anmeldung ausschliesslich per OIDC (Federated Credential); keine Passwoerter. Kontowerte nur als vars.
+#     Workflow-Eingaben gelangen nur ueber env in Skripte, nie als Ausdruck.
+#   - Actions per Commit-SHA gepinnt (Tag als Kommentar); Signier-Werkzeugkette ohne Actions-Cache.
+#   - Im Signier-Job kein pip und kein eigener Drittcode; Helfer nur mit Python-Standardbibliothek. Ausnahme:
+#     azure/artifact-signing-action installiert zur Laufzeit versionierte Microsoft-Abhaengigkeiten (PowerShell-
+#     Modul ArtifactSigning 0.1.8 aus der PSGallery, bei Bedarf NuGet-Pakete wie Microsoft.Windows.SDK.BuildTools
+#     und Microsoft.ArtifactSigning.Client) - versions-, nicht hashgepinnt; cache-dependencies "false".
+#   - Logs und Artefakte eines oeffentlichen Repositorys sind oeffentlich: sie enthalten nur Build-ID, Hashes, Groessen,
+#     Zertifikatsnamen und Testwerte. Dateinamen tragen nur die Build-ID (keine Kundennamen).
+#   - Statisch geprueft durch tools/signing/workflow_check.py, lokal durchgespielt durch tools/signing/trockenlauf.py
+#     (Fake-Werkzeuge und Fake-Ablage, kein Azure, kein Netz).
+name: Fernwartungs-Installer signieren
+run-name: Installer signieren ${{ inputs.build_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "Build-ID des Installers (JJJJMMTT-HHMMSS aus build.sh)"
+        required: true
+        type: string
+      sha256:
+        description: "SHA-256 des unsignierten Installers (64 Hex-Zeichen)"
+        required: true
+        type: string
+      version:
+        description: "Release-Version fuer das Qualitaets-Gate, z. B. 2026.11.1"
+        required: true
+        type: string
+      kanal:
+        description: "Release-Kanal"
+        required: true
+        type: choice
+        options:
+          - intern
+          - pilot
+          - produktiv
+        default: pilot
+      vorgaenger_id:
+        description: "Release-ID des freigegebenen Vorgaengers (leer nur bei Erstausrollung)"
+        required: false
+        type: string
+        default: ""
+      erstausrollung:
+        description: "Erstausrollung ohne Vorgaenger"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sign-installer
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Tests des Signaturpfads (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Unit-, Mutations- und Trockenlauf-Tests
+        shell: bash
+        run: python3 tools/test_artifact_signing.py
+
+      - name: Statische Workflow-Pruefung
+        shell: bash
+        run: python3 tools/signing/workflow_check.py
+
+  vorpruefung:
+    name: Installer vorpruefen (Ablage, Qualitaet, SHA-256, Build-ID)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    env:
+      SIGN_BUILD_ID: ${{ inputs.build_id }}
+      SIGN_SHA256: ${{ inputs.sha256 }}
+      SIGN_VERSION: ${{ inputs.version }}
+      SIGN_KANAL: ${{ inputs.kanal }}
+      SIGN_VORGAENGER_ID: ${{ inputs.vorgaenger_id }}
+      SIGN_ERSTAUSROLLUNG: ${{ inputs.erstausrollung }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Eingaben pruefen
+        id: eingaben
+        shell: bash
+        run: python3 tools/signing/artifact_signing.py eingaben
+
+      - name: Repository und Environment-Schutz pruefen (Pflicht-Reviewer, nur main)
+        id: umgebung
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/signing/artifact_signing.py umgebung
+
+      - name: Qualitaetsnachweis aus der Ablage pruefen
+        id: qualitaet
+        shell: bash
+        env:
+          SIGNING_STORAGE_TOKEN: ${{ secrets.SIGNING_STORAGE_TOKEN }}
+        run: python3 tools/signing/artifact_signing.py qualitaet
+
+      - name: Unsignierten Installer aus der Ablage laden
+        id: laden
+        shell: bash
+        env:
+          SIGNING_STORAGE_TOKEN: ${{ secrets.SIGNING_STORAGE_TOKEN }}
+        run: python3 tools/signing/artifact_signing.py laden
+
+      - name: Vorpruefung (SHA-256, Build-ID, NSIS, unsigniert)
+        id: vorpruefen
+        shell: bash
+        run: python3 tools/signing/artifact_signing.py vorpruefen
+
+  signieren:
+    name: Signieren und nachpruefen (Windows, manuelle Freigabe)
+    needs:
+      - tests
+      - vorpruefung
+    runs-on: windows-2025
+    environment: release-signing
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      SIGN_BUILD_ID: ${{ inputs.build_id }}
+      SIGN_SHA256: ${{ inputs.sha256 }}
+      SIGN_VERSION: ${{ inputs.version }}
+      SIGN_KANAL: ${{ inputs.kanal }}
+      SIGN_VORGAENGER_ID: ${{ inputs.vorgaenger_id }}
+      SIGN_ERSTAUSROLLUNG: ${{ inputs.erstausrollung }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Eingaben pruefen
+        id: eingaben
+        shell: pwsh
+        run: python tools/signing/artifact_signing.py eingaben
+
+      - name: Qualitaetsnachweis erneut pruefen
+        id: qualitaet
+        shell: pwsh
+        env:
+          SIGNING_STORAGE_TOKEN: ${{ secrets.SIGNING_STORAGE_TOKEN }}
+        run: python tools/signing/artifact_signing.py qualitaet
+
+      - name: Unsignierten Installer erneut aus der Ablage laden
+        id: laden
+        shell: pwsh
+        env:
+          SIGNING_STORAGE_TOKEN: ${{ secrets.SIGNING_STORAGE_TOKEN }}
+        run: python tools/signing/artifact_signing.py laden
+
+      - name: Vorpruefung wiederholen (gleicher erwarteter SHA-256)
+        id: vorpruefen
+        shell: pwsh
+        run: python tools/signing/artifact_signing.py vorpruefen
+
+      - name: Azure-Anmeldung per OIDC (ohne Geheimnis)
+        id: azure_login
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Signieren mit Artifact Signing
+        id: signieren
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ steps.vorpruefen.outputs.datei }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          description: Insight-IT Fernwartung
+          cache-dependencies: "false"
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Azure-Sitzung beenden
+        id: abmelden
+        if: always()
+        shell: pwsh
+        run: az account clear
+
+      - name: Nachpruefen (signtool verify /pa /tw /v, Inhalt, Herausgeber, Zeitstempel)
+        id: nachpruefen
+        shell: pwsh
+        env:
+          SIGN_HERAUSGEBER: ${{ vars.ARTIFACT_SIGNING_PUBLISHER }}
+        run: python tools/signing/artifact_signing.py nachpruefen
+
+      - name: Signierten Installer in der Ablage ablegen
+        id: hochladen
+        shell: pwsh
+        env:
+          SIGNING_STORAGE_TOKEN: ${{ secrets.SIGNING_STORAGE_TOKEN }}
+        run: python tools/signing/artifact_signing.py hochladen
+
+      - name: Ablage pruefen (Manifest, erneuter Download, SHA-256)
+        id: ablage_pruefen
+        shell: pwsh
+        env:
+          SIGNING_STORAGE_TOKEN: ${{ secrets.SIGNING_STORAGE_TOKEN }}
+        run: python tools/signing/artifact_signing.py ablage-pruefen
+
+      - name: Nachweise fuer das Qualitaets-Gate hochladen (nur JSON)
+        id: upload_nachweis
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signatur-nachweis-${{ inputs.build_id }}
+          path: ${{ steps.nachpruefen.outputs.nachweis_ordner }}
+          if-no-files-found: error
+          retention-days: 30
