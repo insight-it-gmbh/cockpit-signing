@@ -21,6 +21,10 @@ Hilfs-Unterbefehle für die gedruckten Befehle (lesen nur stdin/Dateien, kein Ne
                                                 Nachweise = dieser Lauf + Dispatch-Werte + lokaler SHA-256
     ergebnis-pruefen <download> <bericht> <ziel> <SHA256_UNSIGNIERT>
                                                 signierter Installer aus der Ablage → SHA-256/Größe = Bericht → <ziel>
+    loeschen-pruefen <BUILD_ID> <SHA256_UNSIGNIERT> <SHA256_QUALITY> <LAUF|-> <LAUF_STAND_JSON|->
+                                                stdin: Manifest der Ablage → Exit 0 nur, wenn der Build nachweislich
+                                                der eigene Upload ohne signed ist und der Lauf nie gestartet wurde
+                                                (- -) bzw. laut gh run view fehlgeschlagen/abgebrochen endete
 """
 import argparse
 import hashlib
@@ -112,6 +116,46 @@ def manifest_pruefen(manifest, build_id, sha256_unsigniert, sha256_quality):
     if any(isinstance(a, dict) and a.get("kind") == "signed" for a in manifest["artifacts"]):
         raise sig.SigningError("signiert_vorhanden", "Ablage enthält für %s schon einen signierten Installer" % build_id)
     return manifest
+
+
+LOESCHBAR = ("failure", "cancelled", "timed_out", "startup_failure")   # Lauf endete nachweislich ohne Erfolg
+
+
+def loeschen_pruefen(manifest, build_id, sha256_unsigniert, sha256_quality, lauf_id, stand):
+    """Darf das Aufräumen den Build aus der Ablage löschen (DELETE löscht ALLE Artefakte des Builds)? Nur wenn
+    nachweislich: (1) der Lauf nie gestartet wurde (lauf_id und stand None) oder `gh run view <LAUF> --json
+    databaseId,status,conclusion` genau diesen Lauf als abgeschlossen und fehlgeschlagen/abgebrochen meldet,
+    (2) das Manifest keinen signierten Installer enthält, (3) unsigned (und quality, falls vorhanden) genau die eigenen,
+    lokal geprüften Dateien sind. Sonst SigningError – im Zweifel nichts löschen (Retention 7 Tage)."""
+    _pruefe_build_id(build_id)
+    _pruefe_sha(sha256_unsigniert)
+    _pruefe_sha(sha256_quality)
+    if lauf_id is None:
+        if stand is not None:
+            raise sig.SigningError("lauf_unbekannt", "Laufstatus ohne Lauf-ID")
+    else:
+        lauf_id = _id(lauf_id, "lauf_liste", "Lauf-ID")
+        if not isinstance(stand, dict) or isinstance(stand.get("databaseId"), bool) \
+                or str(stand.get("databaseId")) != lauf_id:
+            raise sig.SigningError("lauf_unbekannt", "Ausgang von Lauf %s nicht belegt" % lauf_id)
+        if stand.get("status") != "completed":
+            raise sig.SigningError("lauf_offen", "Lauf %s ist noch nicht abgeschlossen (Status %s)"
+                                   % (lauf_id, str(stand.get("status"))[:20]))
+        if stand.get("conclusion") not in LOESCHBAR:
+            raise sig.SigningError("lauf_nicht_fehlgeschlagen", "Lauf %s endete mit %s – nicht nachweislich fehlgeschlagen"
+                                   % (lauf_id, str(stand.get("conclusion"))[:20]))
+    if not isinstance(manifest, dict) or manifest.get("build_id") != build_id \
+            or not isinstance(manifest.get("artifacts"), list) or not all(isinstance(a, dict) for a in manifest["artifacts"]):
+        raise sig.SigningError("manifest_ungueltig", "Manifest gehört nicht zu Build %s oder ist unvollständig" % build_id)
+    arten = [a.get("kind") for a in manifest["artifacts"]]
+    if "signed" in arten:
+        raise sig.SigningError("signiert_vorhanden", "Ablage enthält für %s einen signierten Installer" % build_id)
+    if set(arten) - {"unsigned", "quality"}:
+        raise sig.SigningError("fremder_upload", "Manifest enthält unerwartete Artefakte")
+    sig.pruefe_manifest(manifest, build_id, "unsigned", sha256_unsigniert, abweichung_code="fremder_upload")
+    if "quality" in arten:
+        sig.pruefe_manifest(manifest, build_id, "quality", sha256_quality, abweichung_code="fremder_upload")
+    return None
 
 
 def pruefe_bericht(bericht, build_id, sha256_unsigniert):
@@ -239,14 +283,15 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
     layout = sig.pe_layout(data)
     werte = sig.version_strings(data, layout)
     build_id = werte.get("FileVersion", "")
+    with open(quality_pfad, "rb") as fh:
+        q_roh = fh.read(sig.MAX_QUALITY + 1)
     eingaben = sig.lese_eingaben({"SIGN_BUILD_ID": build_id, "SIGN_SHA256": hashlib.sha256(data).hexdigest(),
+                                  "SIGN_QUALITY_SHA256": hashlib.sha256(q_roh).hexdigest(),
                                   "SIGN_VERSION": version, "SIGN_KANAL": kanal, "SIGN_VORGAENGER_ID": vorgaenger_id or "",
                                   "SIGN_ERSTAUSROLLUNG": "true" if erstausrollung else "false"})
     sig.pruefe_installer(data, eingaben["build_id"])
     if layout["sec_va"] or layout["sec_size"]:
         raise sig.SigningError("bereits_signiert", "Installer enthält schon eine Signatur – nur frische Builds")
-    with open(quality_pfad, "rb") as fh:
-        q_roh = fh.read(sig.MAX_QUALITY + 1)
     if len(q_roh) > sig.MAX_QUALITY:
         raise sig.SigningError("quality_ungueltig", "quality.json größer als 1 MiB")
     try:
@@ -255,7 +300,7 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
         raise sig.SigningError("quality_ungueltig", "quality.json ist kein JSON") from None
     if not sig.REPO_RE.match(repo or ""):
         raise sig.SigningError("eingabe_repo", "Repository muss owner/repo sein")
-    bid, sha_u, sha_q = eingaben["build_id"], eingaben["sha256"], hashlib.sha256(q_roh).hexdigest()
+    bid, sha_u, sha_q = eingaben["build_id"], eingaben["sha256"], eingaben["quality_sha256"]
     kopie, q_kopie = os.path.join(ziel, unsigniert_name(bid)), os.path.join(ziel, quality_name(bid))
     for quelle, k in ((pfad, kopie), (quality_pfad, q_kopie)):
         if os.path.abspath(k) == os.path.abspath(quelle):
@@ -265,7 +310,7 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
     _kopiere_geprueft(pfad, kopie, sha_u)
     _kopiere_geprueft(quality_pfad, q_kopie, sha_q)
     q, r = shlex.quote, shlex.quote(repo)
-    felder = ["-f build_id=%s" % bid, "-f sha256=%s" % sha_u, "-f version=%s" % q(version),
+    felder = ["-f build_id=%s" % bid, "-f sha256=%s" % sha_u, "-f quality_sha256=%s" % sha_q, "-f version=%s" % q(version),
               "-f kanal=%s" % kanal] + (["-f vorgaenger_id=%s" % q(vorgaenger_id)] if vorgaenger_id else ["-f erstausrollung=true"])
     vb = "python3 %s" % q(os.path.abspath(__file__))
     erg = os.path.join(ziel, "signiert-" + bid)
@@ -278,66 +323,87 @@ def vorbereiten(pfad, quality_pfad, version, kanal, vorgaenger_id, erstausrollun
     return eingaben, kopie, "\n".join([
         "# Geprüft: %s – Build-ID %s, SHA-256 %s, %d Bytes, NSIS, unsigniert" % (unsigniert_name(bid), bid, sha_u, len(data)),
         "# Geprüft: %s – bestanden, remote_e2e_fps %g, SHA-256 %s" % (quality_name(bid), qualitaet["remote_e2e_fps"], sha_q),
-        "# Diese Werte vergleicht die freigebende Person mit der Zusammenfassung der Vorprüfung.",
+        "# Diese Werte vergleicht die freigebende Person mit der Zusammenfassung der Vorprüfung; der Lauf erhält beide",
+        "# SHA-256 als Eingaben (sha256, quality_sha256) und lehnt jede andere Datei in der Ablage ab.",
         "# Befehle der Reihe nach in EINER bash ausführen (Shell bis Schritt 5 offen lassen) oder als Skript mit",
-        "# bash -euo pipefail. Jeder Prüfbefehl endet bei Abweichung mit FEHLER [code] und Exit ≠ 0.",
+        "# bash -euo pipefail. Jeder Prüf- und Netzbefehl endet bei Abweichung mit Exit ≠ 0 und beendet die Shell bzw.",
+        "# das Skript (|| exit 1, auch ohne set -e); aufraeumen läuft dann über trap EXIT.",
         "# Voraussetzung: SIGNING_STORAGE_TOKEN ist in dieser Shell exportiert (aus dem Passwortmanager; nie in Dateien,",
         "# Verlauf oder Argumenten). Er geht nur per printf (Builtin) über stdin an curl (-H @-).",
         "",
         "# 0) Ablage, Token-Kopf und Aufräumfunktion. aufraeumen läuft beim Ende der Shell bzw. des Skripts automatisch",
-        "#    (trap EXIT, auch unter set -e nach einem Fehler) und in Schritt 5 ausdrücklich; jeder Teil genau einmal.",
-        "#    Ablage: nur ein eigener, nicht erfolgreich signierter Upload wird gelöscht. Nach einem grünen Lauf bleibt",
-        "#    der Build bis zur Retention (7 Tage) liegen – signierte Artefakte nie von Hand löschen.",
+        "#    (trap EXIT) und in Schritt 5 ausdrücklich; jeder Teil genau einmal.",
+        "#    Ablage: gelöscht wird nur ein EIGENER Upload (PUT 201) ohne signed, dessen Lauf nie gestartet wurde oder",
+        "#    laut gh run view nachweislich fehlschlug/abgebrochen wurde (Prüfung loeschen-pruefen). In jedem anderen",
+        "#    Fall – 409, Lauf grün, offen oder unbekannt, signed vorhanden – bleibt der Build bis zur Retention",
+        "#    (7 Tage) liegen; signierte Artefakte nie von Hand löschen.",
         "ABLAGE=%s" % q(sig.STORAGE_BASIS),
         "HOCHGELADEN=0",
+        "GESTARTET=0",
+        "LAUF=",
         "LAUF_OK=0",
         "ablage_kopf() { printf 'Authorization: Bearer %s\\n' \"${SIGNING_STORAGE_TOKEN:?}\"; }",
+        "loeschen_erlaubt() {",
+        "  local stand=- manifest",
+        "  if [ \"$GESTARTET\" = 1 ]; then",
+        "    [ -n \"$LAUF\" ] || { echo \"HINWEIS: Lauf gestartet, aber nicht bestimmt – Ausgang unbekannt\" >&2; return 1; }",
+        "    stand=\"$(gh run view --repo %s \"$LAUF\" --json databaseId,status,conclusion)\"" % r
+        + " || { echo \"HINWEIS: Ausgang von Lauf $LAUF nicht abrufbar\" >&2; return 1; }",
+        "  fi",
+        "  manifest=\"$(ablage_kopf | %s -H @- \"$ABLAGE/%s/manifest\")\"" % (CURL, bid)
+        + " || { echo \"HINWEIS: Manifest nicht abrufbar\" >&2; return 1; }",
+        "  printf '%%s' \"$manifest\" | %s loeschen-pruefen %s %s %s \"${LAUF:--}\" \"$stand\"" % (vb, bid, sha_u, sha_q),
+        "}",
         "aufraeumen() {",
         "  trap - EXIT",
-        "  if [ \"$HOCHGELADEN\" = 1 ] && [ \"$LAUF_OK\" != 1 ]; then",
-        "    ablage_kopf | %s -X DELETE -H @- %s > /dev/null"
-        " || echo \"WARNUNG: Build %s nicht aus der Ablage gelöscht – Retention entfernt ihn nach 7 Tagen\" >&2" % (CURL, build_url, bid),
-        "  elif [ \"$LAUF_OK\" = 1 ]; then",
+        "  if [ \"$HOCHGELADEN\" = 1 ] && [ \"$LAUF_OK\" != 1 ] && loeschen_erlaubt; then",
+        "    ablage_kopf | %s -X DELETE -H @- %s > /dev/null" % (CURL, build_url)
+        + " || echo \"WARNUNG: Build %s nicht aus der Ablage gelöscht – Retention entfernt ihn nach 7 Tagen\" >&2" % bid,
+        "  elif [ \"$HOCHGELADEN\" = 1 ]; then",
         "    echo \"HINWEIS: Build %s bleibt bis zur Retention (7 Tage) in der Ablage – nicht von Hand löschen\" >&2" % bid,
         "  fi",
         "  rm -f %s %s %s" % (q(kopie), q(q_kopie), q(roh)),
         "}",
         "trap aufraeumen EXIT",
-        ": \"${SIGNING_STORAGE_TOKEN:?SIGNING_STORAGE_TOKEN in dieser Shell exportieren}\"",
+        "[ -n \"${SIGNING_STORAGE_TOKEN:-}\" ] || { echo \"FEHLER: SIGNING_STORAGE_TOKEN in dieser Shell exportieren\" >&2; exit 1; }",
         "",
         "# 1) Ablage erreichbar? Dann unsignierten Installer und Qualitätsnachweis hochladen (PUT, kein Überschreiben:",
         "#    409 = Build existiert schon – dann nichts löschen, sondern prüfen) und das Manifest gegenprüfen.",
-        "%s %s > /dev/null" % (CURL, q(sig.STORAGE_HEALTH)),
-        "ablage_kopf | %s -X PUT -H @- -H 'X-Artifact-SHA256: %s' -H 'Content-Type: application/octet-stream' "
-        "--data-binary @%s \"$ABLAGE/%s/unsigned\" > /dev/null" % (CURL, sha_u, q(kopie), bid),
-        "HOCHGELADEN=1",
+        "#    HOCHGELADEN wird nur nach erfolgreichem PUT des Installers gesetzt.",
+        "%s %s > /dev/null || exit 1" % (CURL, q(sig.STORAGE_HEALTH)),
+        "if ablage_kopf | %s -X PUT -H @- -H 'X-Artifact-SHA256: %s' -H 'Content-Type: application/octet-stream' "
+        "--data-binary @%s \"$ABLAGE/%s/unsigned\" > /dev/null; then HOCHGELADEN=1; else exit 1; fi" % (CURL, sha_u, q(kopie), bid),
         "ablage_kopf | %s -X PUT -H @- -H 'X-Artifact-SHA256: %s' -H 'Content-Type: application/json' "
-        "--data-binary @%s \"$ABLAGE/%s/quality\" > /dev/null" % (CURL, sha_q, q(q_kopie), bid),
-        "ablage_kopf | %s -H @- \"$ABLAGE/%s/manifest\" | %s manifest-pruefen %s %s %s" % (CURL, bid, vb, bid, sha_u, sha_q),
+        "--data-binary @%s \"$ABLAGE/%s/quality\" > /dev/null || exit 1" % (CURL, sha_q, q(q_kopie), bid),
+        "ablage_kopf | %s -H @- \"$ABLAGE/%s/manifest\" | %s manifest-pruefen %s %s %s || exit 1"
+        % (CURL, bid, vb, bid, sha_u, sha_q),
         "",
-        "# 2) Vorhandene Läufe dieser Build-ID merken (nie wiederverwenden), dann Signaturlauf starten (nur von main)",
-        "VORHER=\"$(%s | %s laeufe-vorher %s)\"" % (liste, vb, bid),
+        "# 2) Vorhandene Läufe dieser Build-ID merken (nie wiederverwenden), dann Signaturlauf starten (nur von main).",
+        "#    GESTARTET wird schon vor dem Start gesetzt: ein Dispatch kann trotz Fehlermeldung angekommen sein.",
+        "VORHER=\"$(%s | %s laeufe-vorher %s)\" || exit 1" % (liste, vb, bid),
         "echo \"Ältere Läufe dieser Build-ID: ${VORHER:?Läufe vor dem Start nicht bestimmt}\"",
-        "gh workflow run %s --repo %s --ref main %s" % (WORKFLOW_DATEI, r, " ".join(felder)),
+        "GESTARTET=1",
+        "gh workflow run %s --repo %s --ref main %s || exit 1" % (WORKFLOW_DATEI, r, " ".join(felder)),
         "",
-        "# 3) NEUEN Lauf genau einmal bestimmen (Workflow, workflow_dispatch, main, Titel „%s“, nicht in VORHER)," % (
-            LAUF_TITEL % bid),
-        "#    verfolgen und im Environment release-signing freigeben. Kein/mehrere Treffer: Abbruch, LAUF nie raten.",
+        "# 3) NEUEN Lauf genau einmal bestimmen (Workflow, workflow_dispatch, main, Titel „%s“, nicht in VORHER),\n"
+        % (LAUF_TITEL % bid)
+        + "#    verfolgen und im Environment release-signing freigeben. Kein/mehrere Treffer: Abbruch, LAUF nie raten.\n"
+        "#    Scheitert nur die Beobachtung (watch: Netz, Strg-C, Terminal zu), entscheidet aufraeumen per gh run view – ein grüner,\n"
+        "#    offener oder unbekannter Lauf wird nie gelöscht; Ergebnis dann mit Schritt 4 laden.",
         "sleep 10",
-        "LAUF=\"$(%s | %s lauf-id %s \"${VORHER:?Läufe vor dem Start nicht bestimmt}\")\"" % (liste, vb, bid),
+        "LAUF=\"$(%s | %s lauf-id %s \"${VORHER:?Läufe vor dem Start nicht bestimmt}\")\" || exit 1" % (liste, vb, bid),
         "echo \"Lauf ${LAUF:?Lauf nicht bestimmt}\"",
-        "gh run watch --repo %s \"${LAUF:?Lauf nicht bestimmt}\" --exit-status" % r,
-        "LAUF_OK=1",
+        "if gh run watch --repo %s \"${LAUF:?Lauf nicht bestimmt}\" --exit-status; then LAUF_OK=1; else exit 1; fi" % r,
         "",
         "# 4) Ergebnis laden: Nachweise (nur JSON) per gh run download und an diesen Lauf, den lokalen SHA-256 und die",
         "#    Werte dieses Starts binden; den signierten Installer aus der Ablage laden und gegen den Bericht prüfen.",
-        "mkdir -p %s" % q(erg),
-        "gh run download --repo %s \"${LAUF:?Lauf nicht bestimmt}\" --name signatur-nachweis-%s --dir %s"
+        "mkdir -p %s || exit 1" % q(erg),
+        "gh run download --repo %s \"${LAUF:?Lauf nicht bestimmt}\" --name signatur-nachweis-%s --dir %s || exit 1"
         % (r, bid, q(nachweis)),
-        "%s nachweis-pruefen %s %s \"${LAUF:?Lauf nicht bestimmt}\" %s %s %s %s %s"
+        "%s nachweis-pruefen %s %s \"${LAUF:?Lauf nicht bestimmt}\" %s %s %s %s %s || exit 1"
         % (vb, q(nachweis), repo, bid, sha_u, q(version), kanal, q(vorgaenger_id) if vorgaenger_id else KEINE),
-        "ablage_kopf | %s -H @- -o %s \"$ABLAGE/%s/signed\"" % (CURL, q(roh), bid),
-        "%s ergebnis-pruefen %s %s %s %s" % (vb, q(roh), q(bericht), q(erg), sha_u),
+        "ablage_kopf | %s -H @- -o %s \"$ABLAGE/%s/signed\" || exit 1" % (CURL, q(roh), bid),
+        "%s ergebnis-pruefen %s %s %s %s || exit 1" % (vb, q(roh), q(bericht), q(erg), sha_u),
         "",
         "# 5) Aufräumen – IMMER, unabhängig vom Ergebnis (läuft sonst spätestens beim Schließen der Shell): lokale",
         "#    unsignierte Kopie, Qualitätskopie und Download löschen; Ablage siehe Schritt 0.",
@@ -362,7 +428,8 @@ def _menge(text):
     return {_id(t, "lauf_liste", "Lauf-ID (vorher)") for t in text.split(",")}
 
 
-HILFSBEFEHLE = {"manifest-pruefen": 3, "laeufe-vorher": 1, "lauf-id": 2, "nachweis-pruefen": 8, "ergebnis-pruefen": 4}
+HILFSBEFEHLE = {"manifest-pruefen": 3, "laeufe-vorher": 1, "lauf-id": 2, "nachweis-pruefen": 8, "ergebnis-pruefen": 4,
+                "loeschen-pruefen": 5}
 
 
 def hilfsbefehl(argv):
@@ -372,6 +439,8 @@ def hilfsbefehl(argv):
     if len(args) != soll:
         print("Aufruf: vorbereiten.py %s (%d Argumente)" % (befehl, soll), file=sys.stderr)
         return 2
+    if befehl == "loeschen-pruefen":
+        return _loeschen_pruefen_cli(args)
     try:
         if befehl == "manifest-pruefen":
             manifest_pruefen(_lies_json(sys.stdin, "manifest_ungueltig", "Manifest der Ablage"), *args)
@@ -402,6 +471,30 @@ def hilfsbefehl(argv):
     except OSError as exc:
         print("FEHLER [datei_fehlt]: %s" % exc.__class__.__name__, file=sys.stderr)
         return 1
+    return 0
+
+
+def _loeschen_pruefen_cli(args):
+    """Exit 0 = Löschen belegt erlaubt; sonst Exit 1 mit HINWEIS – auch bei jedem unerwarteten Fehler (fail-safe)."""
+    bid, sha_u, sha_q, lauf_id, stand_text = args
+    try:
+        manifest = _lies_json(sys.stdin, "manifest_ungueltig", "Manifest der Ablage")
+        if stand_text == KEINE:
+            stand = None
+        else:
+            try:
+                stand = json.loads(stand_text)
+            except ValueError:
+                raise sig.SigningError("lauf_unbekannt", "Antwort von gh run view ist kein JSON") from None
+        loeschen_pruefen(manifest, bid, sha_u, sha_q, None if lauf_id == KEINE else lauf_id, stand)
+    except sig.SigningError as exc:
+        print("HINWEIS [%s]: %s – nichts gelöscht" % (exc.code, exc.meldung), file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 – im Zweifel nie löschen
+        print("HINWEIS [loeschen_unklar]: %s – nichts gelöscht" % exc.__class__.__name__, file=sys.stderr)
+        return 1
+    print("# Geprüft: Build %s ist nur der eigene Upload ohne signed, Lauf %s – eigener Upload wird gelöscht"
+          % (bid, "nie gestartet" if lauf_id == KEINE else lauf_id + " nachweislich fehlgeschlagen"))
     return 0
 
 

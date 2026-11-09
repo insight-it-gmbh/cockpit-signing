@@ -81,13 +81,15 @@ Listen-Endpunkt. Dateinamen: `insight-fernwartung-<BUILD_ID>.exe`, beim Qualitä
 
 **Retention:** Builds älter als 7 Tage entfernt die Ablage beim nächsten Zugriff selbst. Nach einem erfolgreichen
 Lauf werden signierte Artefakte **nicht** von Hand gelöscht; der Build bleibt bis zur Retention liegen (Download und
-Kontrolle in dieser Zeit). Nur ein eigener Upload, dessen Lauf nicht grün endete, wird von `aufraeumen` gelöscht.
+Kontrolle in dieser Zeit). `aufraeumen` löscht nur einen **eigenen** Upload (PUT 201) ohne `signed`, dessen Lauf nie
+gestartet wurde oder laut `gh run view` nachweislich fehlschlug bzw. abgebrochen wurde (`vorbereiten.py
+loeschen-pruefen`). Bei 409, grünem, offenem oder unbekanntem Lauf und immer bei vorhandenem `signed` wird nichts gelöscht.
 
 Im Workflow gilt der Vertrag so:
 
 | Schritt | Anfragen | Zusatzprüfung |
 |---|---|---|
-| qualitaet | `GET manifest`, `GET quality` | Hash/Größe = Manifest, `bestanden:true`, Build-ID, `remote_e2e_fps` endliche Zahl > 0 |
+| qualitaet | `GET manifest`, `GET quality` | Manifest-Hash = Download = Eingabe `quality_sha256`, Größe = Manifest, `bestanden:true`, Build-ID, `remote_e2e_fps` endliche Zahl > 0 |
 | laden | `GET manifest`, `GET unsigned` | genau ein `unsigned`, Dateiname, Größe ≤ 200 MiB, SHA-256 = Eingabe, noch kein `signed`; Download = Manifest |
 | hochladen | `PUT signed` mit `X-Artifact-SHA256` | nur die nachgeprüfte Datei, ohne `replace` (409 → `storage_konflikt`) |
 | ablage-pruefen | `GET manifest`, `GET signed` | `signed` = geprüfter SHA-256 und Größe, `unsigned` unverändert, erneuter Download bitgleich |
@@ -96,19 +98,21 @@ Im Workflow gilt der Vertrag so:
 
 | Schritt | Prüfung | Codes |
 |---|---|---|
-| eingaben | Build-ID `JJJJMMTT-HHMMSS` (gültiger Zeitpunkt), SHA-256, Version, Kanal, genau eins von Vorgänger-ID/Erstausrollung, Lauf von `refs/heads/main`, keine Überschreibung (`SIGN_GH`, `SIGN_SIGNTOOL`, `SIGN_TROCKENLAUF`, `SIGN_STORAGE_FAKE`) auf **jedem** GitHub-Runner (`GITHUB_ACTIONS=true` oder `RUNNER_ENVIRONMENT` gesetzt, auch selbst gehostet) | `eingabe_build_id`, `eingabe_sha256`, `eingabe_version`, `eingabe_kanal`, `eingabe_vorgaenger`, `eingabe_rollback`, `eingabe_ref`, `override_verboten` |
+| eingaben | Build-ID `JJJJMMTT-HHMMSS` (gültiger Zeitpunkt), SHA-256 des Installers und von quality.json, Version, Kanal, genau eins von Vorgänger-ID/Erstausrollung, Lauf von `refs/heads/main`, keine Überschreibung (`SIGN_GH`, `SIGN_SIGNTOOL`, `SIGN_TROCKENLAUF`, `SIGN_STORAGE_FAKE`) auf **jedem** GitHub-Runner (`GITHUB_ACTIONS=true` oder `RUNNER_ENVIRONMENT` gesetzt, auch selbst gehostet) | `eingabe_build_id`, `eingabe_sha256`, `eingabe_quality_sha256`, `eingabe_version`, `eingabe_kanal`, `eingabe_vorgaenger`, `eingabe_rollback`, `eingabe_ref`, `override_verboten` |
 | umgebung | `repository.full_name` = `GITHUB_REPOSITORY`, `private` passend zu `visibility` (öffentlich erlaubt); Environment `release-signing` existiert, hat Pflicht-Reviewer, `can_admins_bypass` nicht `true` (fehlt das Feld: Hinweis „im Portal prüfen“), Bereitstellung nur vom Zweig `main` | `repo_unbekannt`, `umgebung_fehlt`, `umgebung_ungeschuetzt`, `umgebung_admin_bypass`, `umgebung_zweige` |
-| qualitaet | Token vorhanden und formal gültig; Manifest; quality.json = Manifest; `bestanden:true`, Build-ID, `remote_e2e_fps` | `storage_token_fehlt`, `storage_token_format`, `storage_token`, `storage_nicht_konfiguriert`, `storage_fehlt`, `manifest_ungueltig`, `quality_fehlt`, `quality_abweichung`, `quality_ungueltig`, `storage_nicht_erreichbar`, `storage_weiterleitung` |
+| qualitaet | Token vorhanden und formal gültig; Manifest; quality.json = Manifest = Eingabe `quality_sha256`; `bestanden:true`, Build-ID, `remote_e2e_fps` | `storage_token_fehlt`, `storage_token_format`, `storage_token`, `storage_nicht_konfiguriert`, `storage_fehlt`, `manifest_ungueltig`, `quality_fehlt`, `quality_abweichung`, `quality_ungueltig`, `storage_nicht_erreichbar`, `storage_weiterleitung` |
 | laden | genau ein `unsigned` mit Namen `insight-fernwartung-<BUILD_ID>.exe`, Größe, SHA-256 = Eingabe, noch kein `signed`; Download vollständig und gleich | `asset_fehlt`, `asset_mehrdeutig`, `asset_name`, `asset_groesse`, `digest_abweichung`, `signiert_vorhanden`, `download_abweichung` |
 | vorpruefen | SHA-256 der Datei, PE-Struktur, NSIS-firstheader, `ProductName`/`CompanyName` wie `installer.nsi`, `FileVersion` = `BuildId` = Build-ID, noch keine Signatur | `sha256_abweichung`, `kein_pe`, `pe_defekt`, `kein_nsis`, `versionsinfo_fehlt`, `hersteller_abweichung`, `build_id_abweichung`, `bereits_signiert` |
 | signieren | Artifact Signing (Action); Exit ≠ 0/2 färbt den Job rot | – |
-| nachpruefen | genau ein WIN_CERTIFICATE (PKCS#7) am Dateiende; Inhalt = geprüfte Datei + ≤ 7 Nullbytes + Signatur; Build-ID unverändert; `signtool verify /pa /tw /v` fehlerfrei ohne Warnung; Kette ≥ 2 und Blatt nicht selbst ausgestellt; Aussteller „Microsoft ID Verified CS …“; Inhaber = `ARTIFACT_SIGNING_PUBLISHER`; RFC-3161-Zeitstempel; signtool-Hash = eigener Authenticode-Hash; kein Trockenlauf-Werkzeug; geprüfte Qualität vorhanden | `signatur_fehlt`, `signatur_format`, `zertifikatstabelle_lage`, `inhalt_geaendert`, `signtool_verify`, `nicht_verifiziert`, `selbstsigniert`, `aussteller_abweichung`, `herausgeber_abweichung`, `herausgeber_fehlt`, `zeitstempel_fehlt`, `authenticode_abweichung`, `fake_signtool`, `quality_fehlt` |
+| nachpruefen | genau ein WIN_CERTIFICATE (PKCS#7) am Dateiende; Inhalt = geprüfte Datei + ≤ 7 Nullbytes + Signatur; Build-ID unverändert; `signtool verify /pa /tw /v` fehlerfrei ohne Warnung; Kette ≥ 2 und Blatt nicht selbst ausgestellt; Aussteller „Microsoft ID Verified CS …“; Inhaber = `ARTIFACT_SIGNING_PUBLISHER`; RFC-3161-Zeitstempel; signtool-Hash = eigener Authenticode-Hash; kein Trockenlauf-Werkzeug; geprüfte Qualität vorhanden und = Eingabe `quality_sha256` | `signatur_fehlt`, `signatur_format`, `zertifikatstabelle_lage`, `inhalt_geaendert`, `signtool_verify`, `nicht_verifiziert`, `selbstsigniert`, `aussteller_abweichung`, `herausgeber_abweichung`, `herausgeber_fehlt`, `zeitstempel_fehlt`, `authenticode_abweichung`, `fake_signtool`, `quality_fehlt`, `quality_abweichung` |
 | hochladen | Datei seit Nachprüfung unverändert; PUT ohne Überschreiben | `datei_veraendert`, `storage_konflikt`, `storage_zu_gross`, `storage_abgelehnt`, `storage_token` |
 | ablage_pruefen | Manifest `signed` = SHA-256/Größe der geprüften Datei, `unsigned` unverändert, erneuter Download bitgleich | `upload_fehlt`, `upload_digest`, `upload_abweichung`, `ablage_abweichung` |
 
-Der Installer wird **zweimal** geladen und geprüft (Job `vorpruefung` vor der Freigabe, Job `signieren` danach) – ein
-nach der Vorprüfung per `replace=1` ausgetauschter Installer scheitert am erwarteten SHA-256 (`digest_abweichung`),
-ein gelöschter Build an `storage_fehlt`.
+Installer und Qualitätsnachweis werden **zweimal** geladen und geprüft (Job `vorpruefung` vor der Freigabe, Job
+`signieren` danach) – ein nach der Vorprüfung per `replace=1` ausgetauschter Installer scheitert am erwarteten SHA-256
+(`digest_abweichung`), ein ersetzter Qualitätsnachweis an der Eingabe `quality_sha256` (`quality_abweichung`, auch wenn
+er `bestanden:true` und dieselbe Build-ID trägt), ein gelöschter Build an `storage_fehlt`. Beide Hashes druckt
+`vorbereiten.py` aus den lokal geprüften Dateien in den `gh workflow run`-Befehl.
 
 ## Sicherheitsregeln des Workflows
 
@@ -343,12 +347,15 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
    `insight-fernwartung-<BUILD_ID>.unsigniert.exe` und `quality-<BUILD_ID>.json` an und druckt alle folgenden Befehle
    mit eingesetzten Werten (keine Platzhalter, kein Token).
 5. Die gedruckten Blöcke der Reihe nach in **derselben** bash ausführen (Shell bis Schritt 5 offen lassen) oder als
-   Skript mit `bash -euo pipefail`. Block 0 definiert `ablage_kopf` (Token nur per `printf` über stdin an
-   `curl -H @-`, nie als Argument) und `aufraeumen` und setzt `trap aufraeumen EXIT`.
-   Block 1: `curl … /api/signing/health`, dann `PUT …/<BUILD_ID>/unsigned` und `PUT …/<BUILD_ID>/quality` mit
-   `X-Artifact-SHA256`, danach `vorbereiten.py manifest-pruefen` (Ablage enthält genau diese Hashes, noch kein `signed`).
+   Skript mit `bash -euo pipefail`. Jeder Prüf- und Netzbefehl trägt `|| exit 1` bzw. `if …; then …; else exit 1; fi`
+   und bricht damit auch in einer offenen bash **ohne** `set -e` ab (die Shell endet, `aufraeumen` läuft per trap).
+   Block 0 definiert `ablage_kopf` (Token nur per `printf` über stdin an `curl -H @-`, nie als Argument),
+   `loeschen_erlaubt` und `aufraeumen` und setzt `trap aufraeumen EXIT`.
+   Block 1: `curl … /api/signing/health`, dann `PUT …/<BUILD_ID>/unsigned` (nur bei Erfolg `HOCHGELADEN`) und
+   `PUT …/<BUILD_ID>/quality` mit `X-Artifact-SHA256`, danach `vorbereiten.py manifest-pruefen` (Ablage enthält genau
+   diese Hashes, noch kein `signed`).
 6. Block 2: `vorbereiten.py laeufe-vorher` merkt die schon vorhandenen Läufe derselben Build-ID (`VORHER`), dann
-   `gh workflow run sign-cockpit.yml …`.
+   `gh workflow run sign-cockpit.yml … -f sha256=… -f quality_sha256=…` (`GESTARTET` schon vor dem Start).
 7. Block 3: Job `vorpruefung` abwarten; in der Zusammenfassung Build-ID, SHA-256, Größe und `remote_e2e_fps` mit der
    Ausgabe von Schritt 4 vergleichen. Erst dann im Lauf „Review deployments“ → `release-signing` freigeben. Die Lauf-ID
    bestimmt der gedruckte Block genau **einmal** (`gh run list` gefiltert auf `sign-cockpit.yml`, `workflow_dispatch`,
@@ -357,7 +364,10 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
    dann den Lauf im Browser prüfen und `LAUF=<id>` selbst setzen, nie „den neuesten“ nehmen.
 8. Job `signieren` grün: Zusammenfassungen „Nachprüfung bestanden“ (Inhaber, Aussteller „Microsoft ID Verified CS …“,
    Zeitstempel), „Signierten Installer in der Ablage abgelegt“ und „Ablage geprüft“. Bei Rot: Code nachschlagen
-   (Tabelle oben/Fehlerbilder), nichts verwenden; `aufraeumen` löscht den eigenen Upload.
+   (Tabelle oben/Fehlerbilder), nichts verwenden; `aufraeumen` löscht den eigenen Upload nur, wenn `gh run view` den
+   Lauf als fehlgeschlagen/abgebrochen meldet und kein `signed` vorliegt. Scheitert nur `gh run watch` (Netz, Strg-C,
+   Terminal geschlossen), bleibt ein grüner, offener oder nicht abrufbarer Lauf unangetastet; Ergebnis dann mit den
+   Befehlen aus Block 4 laden.
 9. Block 4: Nachweise per `gh run download … --name signatur-nachweis-<BUILD_ID>` laden und mit
    `vorbereiten.py nachweis-pruefen` binden (Lauf-URL = dieser Lauf, `sha256_unsigniert` = lokal geprüfter Build,
    Version/Kanal/Vorgänger dieses Starts, Nachweis `gueltig`, kein Trockenlauf, Ablage-Eintrag vorhanden; sonst
@@ -373,10 +383,13 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
     Neue Zertifikate können anfangs SmartScreen-Hinweise auslösen (Reputation), das ist kein Signaturfehler.
 12. **Aufräumen – immer, unabhängig vom Ergebnis:** gedruckter letzter Befehl `aufraeumen` (läuft per
     `trap aufraeumen EXIT` sonst automatisch beim Ende der Shell, jeweils genau einmal). Er löscht lokal die
-    unsignierte Kopie, die Qualitätskopie und `download.bin`. In der Ablage löscht er **nur** einen eigenen Upload
-    dieses Durchgangs, dessen Lauf nicht grün endete (`DELETE …/<BUILD_ID>`, damit ein neuer Versuch ohne 409
-    starten kann). Nach einem grünen Lauf bleibt der Build bis zur Retention (7 Tage) liegen; signierte Artefakte
-    nicht von Hand löschen. Endete schon der erste `PUT` mit 409 (Build existiert bereits), wird nichts gelöscht.
+    unsignierte Kopie, die Qualitätskopie und `download.bin`. In der Ablage löscht er (`DELETE …/<BUILD_ID>`, damit
+    ein neuer Versuch ohne 409 starten kann) **nur**, wenn `vorbereiten.py loeschen-pruefen` belegt: eigener Upload
+    dieses Durchgangs (PUT 201, Manifest-Hashes = lokal geprüft), kein `signed`, und der Lauf wurde nie gestartet oder
+    endete laut `gh run view` mit `failure`/`cancelled`/`timed_out`/`startup_failure`. Im Zweifel – Lauf grün, offen,
+    nicht bestimmbar oder nicht abrufbar, Manifest nicht lesbar – wird nichts gelöscht; der Build bleibt bis zur
+    Retention (7 Tage) liegen; signierte Artefakte nicht von Hand löschen. Endete schon der erste `PUT` mit 409 (Build
+    existiert bereits), wird nichts gelöscht – mit und ohne `set -e`.
 
 ## Fehlerbilder der ersten Läufe
 
@@ -389,6 +402,7 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
 | `storage_nicht_erreichbar` / `storage_weiterleitung` | Netz/TLS gestört bzw. Ablage leitet um | `/api/signing/health` prüfen; Weiterleitungen werden nie verfolgt |
 | `storage_fehlt` / `quality_fehlt` / `asset_fehlt` | Build bzw. Datei nicht (mehr) in der Ablage, z. B. Retention nach 7 Tagen | erneut mit `vorbereiten.py` hochladen |
 | `quality_ungueltig` | quality.json nicht bestanden, fremde Build-ID oder ohne `remote_e2e_fps` | Qualitätslauf für genau diesen Build wiederholen |
+| `quality_abweichung` / `eingabe_quality_sha256` | quality.json in der Ablage ≠ lokal geprüfter Nachweis (Eingabe `quality_sha256`), z. B. per `replace=1` ersetzt | nichts signieren; Nachweis prüfen, mit `vorbereiten.py` neu starten |
 | `digest_abweichung` | Erwarteter SHA-256 ≠ Hash in der Ablage (falscher Start oder ausgetauschter Installer) | nichts signieren; Build prüfen, neu hochladen |
 | `signiert_vorhanden` / `storage_konflikt` (HTTP 409) | Build wurde schon signiert bzw. `signed` existiert | vorhandenes Ergebnis verwenden oder neuen Build erzeugen; nie überschreiben |
 | `upload_digest` / `upload_abweichung` | Ablage liefert andere Bytes oder Hashes als geprüft | nichts verwenden; Betrieb der Ablage prüfen lassen, neuer Lauf |
@@ -403,6 +417,7 @@ Kontrolle: `gh variable list --env release-signing --repo "$REPO"` zeigt genau d
 | `herausgeber_abweichung` | `ARTIFACT_SIGNING_PUBLISHER` ≠ Common Name des Zertifikats | Variable auf den gemeldeten Inhaber setzen, wenn er korrekt ist |
 | `aussteller_abweichung` | Zertifikat nicht von Artifact Signing | Konto/Profil prüfen |
 | `lauf_fehlt` / `lauf_mehrdeutig` | neuer Lauf noch nicht gelistet bzw. mehrere neue Läufe mit derselben Build-ID | einige Sekunden warten bzw. Lauf im Browser prüfen und `LAUF=<id>` selbst setzen |
+| `HINWEIS [lauf_offen]` / `[lauf_unbekannt]` / `[lauf_nicht_fehlgeschlagen]` / `[signiert_vorhanden]` / `[fremder_upload]` beim Aufräumen | `loeschen-pruefen` konnte keinen eigenen, fehlgeschlagenen Upload ohne `signed` belegen | gewollt: nichts gelöscht, Retention (7 Tage); Lauf im Browser prüfen, Ergebnis ggf. mit Block 4 laden |
 | `sha256_abweichung` beim Laden | Download unvollständig oder verändert | Datei verwerfen, erneut laden |
 
 ## Lokaler Trockenlauf und statische Prüfung (ohne Azure, ohne Netz)
@@ -419,7 +434,7 @@ simuliert – `azure/artifact-signing-action` nach dem Quelltext von v2.0.0 und 
 Fake mit demselben Vertrag (`tools/signing/fake_storage.py`), eingehängt als injizierter Transport
 (`SIGN_STORAGE_FAKE`, auf GitHub-Runnern verboten); der Client-Code ist derselbe wie produktiv. HTTP läuft in keinem
 Test über das Netz; die Tests sperren Socket-Verbindungen. Die gedruckten Befehle von `vorbereiten.py` laufen in den
-Tests unter `bash -euo pipefail` gegen ein curl-Double auf derselben Fake-Ablage und ein gh-Double. Fake-Signaturen
+Tests unter `bash -euo pipefail` und ohne `set -e` gegen ein curl-Double auf derselben Fake-Ablage und ein gh-Double. Fake-Signaturen
 sind gekennzeichnet; ihr Nachweis ist immer `ungueltig`, und außerhalb des Trockenlaufs bricht die Nachprüfung mit
 `fake_signtool` ab.
 

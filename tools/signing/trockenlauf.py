@@ -51,8 +51,8 @@ GIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 REPO_NAME = "trockenlauf/cockpit-signing"
 SERVER = "https://github.example.invalid"
 ABLAGE_TOKEN = "trockenlauf-ablage-kein-geheimnis-0001"     # Testwert der Fake-Ablage, kein echtes Token
-EINGABEN = {"build_id": BUILD_ID, "sha256": None, "version": "2026.11.1-trockenlauf", "kanal": "pilot",
-            "vorgaenger_id": "", "erstausrollung": True}
+EINGABEN = {"build_id": BUILD_ID, "sha256": None, "quality_sha256": None, "version": "2026.11.1-trockenlauf",
+            "kanal": "pilot", "vorgaenger_id": "", "erstausrollung": True}
 VARIABLEN = {"AZURE_CLIENT_ID": "trockenlauf-client", "AZURE_TENANT_ID": "trockenlauf-mandant",
              "AZURE_SUBSCRIPTION_ID": "trockenlauf-abonnement",
              "ARTIFACT_SIGNING_ENDPOINT": "https://weu.codesigning.azure.net",
@@ -230,6 +230,8 @@ SZENARIEN = [
              eingaben={"build_id": "2026-11-09"}),
     Szenario("eingabe_sha256", "SHA-256 kein Hexwert", ("vorpruefung", "eingaben", "eingabe_sha256"),
              eingaben={"sha256": "kein-hash"}),
+    Szenario("eingabe_quality_sha256", "SHA-256 des Qualitätsnachweises kein Hexwert",
+             ("vorpruefung", "eingaben", "eingabe_quality_sha256"), eingaben={"quality_sha256": "kein-hash"}),
     Szenario("eingabe_rollback", "Vorgänger und Erstausrollung zugleich", ("vorpruefung", "eingaben", "eingabe_rollback"),
              eingaben={"vorgaenger_id": "R-0123456789ab", "erstausrollung": True}),
     Szenario("falscher_zweig", "Lauf nicht von main", ("vorpruefung", "eingaben", "eingabe_ref"), ref="refs/heads/feature"),
@@ -271,6 +273,10 @@ SZENARIEN = [
              ablage={"quality_roh": {"build_id": "20261108-235959"}}),
     Szenario("quality_beschaedigt", "Download von quality.json ≠ Manifest", ("vorpruefung", "qualitaet", "quality_abweichung"),
              ablage={"stoerung": {"get_falsch": ["quality"]}}),
+    Szenario("quality_anderer_nachweis", "Ablage enthält einen anderen (gültigen) Nachweis als den lokal geprüften",
+             ("vorpruefung", "qualitaet", "quality_abweichung"), quality_sha_falsch=True),
+    Szenario("quality_ersetzt_nach_vorpruefung", "quality.json nach der Vorprüfung per replace=1 durch einen anderen "
+             "bestandenen Nachweis ersetzt", ("signieren", "qualitaet", "quality_abweichung"), zwischen="quality_tausch"),
     Szenario("unsigned_fehlt", "Qualität vorhanden, Installer fehlt", ("vorpruefung", "laden", "asset_fehlt"),
              ablage={"ohne": ["unsigned"]}),
     Szenario("manifest_sha_abweichend", "Erwarteter SHA-256 ≠ Hash in der Ablage", ("vorpruefung", "laden", "digest_abweichung"),
@@ -352,9 +358,13 @@ class Lauf:
         self.protokoll_gh = os.path.join(basis, "gh-protokoll.jsonl")
         self.installer = baue_installer(**a.get("installer", {}))
         self.sha256 = hashlib.sha256(self.installer).hexdigest()
-        self.eingaben = dict(EINGABEN, sha256=self.sha256)
+        self.quality = quality_bytes(**a.get("ablage", {}).get("quality_roh", {}))
+        # Dispatch-Werte wie von vorbereiten.py gedruckt: SHA-256 des lokal geprüften Installers und quality.json
+        self.eingaben = dict(EINGABEN, sha256=self.sha256, quality_sha256=hashlib.sha256(self.quality).hexdigest())
         if a.get("sha_falsch"):
             self.eingaben["sha256"] = hashlib.sha256(b"anderer Build").hexdigest()
+        if a.get("quality_sha_falsch"):
+            self.eingaben["quality_sha256"] = hashlib.sha256(quality_bytes(remote_e2e_fps=13.1)).hexdigest()
         self.eingaben.update(a.get("eingaben", {}))
         self.vars = dict(VARIABLEN, **a.get("vars", {}))
         self.secrets = dict({"SIGNING_STORAGE_TOKEN": ABLAGE_TOKEN}, **a.get("secrets", {}))
@@ -385,7 +395,6 @@ class Lauf:
     def _ablage_einrichten(self, ab):
         token = ab["token"] if "token" in ab else ABLAGE_TOKEN
         self.ablage = fake_storage.FakeAblage.einrichten(self.ablage_ordner, token)
-        self.quality = quality_bytes(**ab.get("quality_roh", {}))
         ohne = ab.get("ohne", ())
         if "unsigned" not in ohne:
             self.ablage_put("unsigned", self.installer, roh=ab.get("roh"))
@@ -488,6 +497,8 @@ class Lauf:
         art = self.s.a.get("zwischen")
         if art == "tausch":
             self.ablage_put("unsigned", baue_installer(saat=99), replace=True)
+        elif art == "quality_tausch":   # gültig, bestanden, gleiche Build-ID – aber nicht der freigegebene Nachweis
+            self.ablage_put("quality", quality_bytes(remote_e2e_fps=16.9), replace=True)
         elif art == "loeschen":
             status, _ = self.ablage.anfrage("DELETE", "%s/%s" % (sig.STORAGE_BASIS, BUILD_ID),
                                             {"Authorization": "Bearer " + ABLAGE_TOKEN}, None)

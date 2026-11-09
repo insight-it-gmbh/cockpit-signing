@@ -17,10 +17,14 @@ bisherigen privaten Repository). Kein GitHub-Repository angelegt, kein Push, kei
 - `tools/signing/fake_storage.py`: Fake der Ablage nach Vertrag (inkl. 400/401/404/409/413/422/503, replace, Retention
   7 Tage) als Datei-Transport und curl-Double.
 - `tools/signing/vorbereiten.py`: druckt curl-Befehle (Token nur per `printf | curl -H @-`), `manifest-pruefen`,
-  Laden des signierten Installers aus der Ablage; Ablage-Löschung nur für eigenen Upload ohne grünen Lauf.
+  Laden des signierten Installers aus der Ablage. Ablage-Löschung nur nach `loeschen-pruefen`: eigener Upload (PUT 201)
+  ohne `signed`, Lauf nie gestartet oder laut `gh run view` fehlgeschlagen/abgebrochen; nie nach 409, bei grünem,
+  offenem oder unbekanntem Lauf (auch wenn nur `gh run watch` scheitert). Alle Befehle brechen auch ohne `set -e` ab.
+- Dispatch-Eingabe `quality_sha256`: bindet quality.json an den lokal geprüften Nachweis; `qualitaet` (beide Jobs) und
+  `nachpruefen` lehnen einen ersetzten Nachweis ab (`quality_abweichung`).
 - `tools/signing/workflow_check.py`: Secret-Ort, Release-/Installer-Artefakt-Verbot, Host-Allowlist, eigener
   Secret-Scan (ersetzt die Abhängigkeit vom privaten Qualitätsmodul).
-- `tools/signing/trockenlauf.py`: 52 Szenarien (inkl. öffentliches Repository, Token-, Quality-, Ablage-Fehler).
+- `tools/signing/trockenlauf.py`: 55 Szenarien (inkl. öffentliches Repository, Token-, Quality-, Ablage-Fehler).
 - `docs/release-signing.md`, `README.md`.
 
 ## Offen (Orchestrator / Freigabeverantwortliche)
@@ -35,8 +39,8 @@ bisherigen privaten Repository). Kein GitHub-Repository angelegt, kein Push, kei
 ## Testbefehle
 
 ```bash
-python3 tools/test_artifact_signing.py      # erwartet: 56 Tests OK (1 Skip ohne PyYAML)
+python3 tools/test_artifact_signing.py      # erwartet: 60 Tests OK (1 Skip ohne PyYAML)
 python3 tools/signing/workflow_check.py     # erwartet: ohne Befund
-python3 tools/signing/trockenlauf.py        # erwartet: 52/52 Szenarien wie erwartet
+python3 tools/signing/trockenlauf.py        # erwartet: 55/55 Szenarien wie erwartet
 uv run --no-project --with pyyaml python3 tools/test_artifact_signing.py   # optional: YAML-Gegenprobe ohne Skip
 ```

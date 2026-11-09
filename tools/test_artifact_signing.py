@@ -120,8 +120,8 @@ def meldung_von(fn, *args, **kw):
 
 
 def gueltige_eingaben(**aenderung):
-    env = {"SIGN_BUILD_ID": BID, "SIGN_SHA256": "a" * 64, "SIGN_VERSION": "2026.11.1", "SIGN_KANAL": "pilot",
-           "SIGN_VORGAENGER_ID": "", "SIGN_ERSTAUSROLLUNG": "true"}
+    env = {"SIGN_BUILD_ID": BID, "SIGN_SHA256": "a" * 64, "SIGN_QUALITY_SHA256": "c" * 64, "SIGN_VERSION": "2026.11.1",
+           "SIGN_KANAL": "pilot", "SIGN_VORGAENGER_ID": "", "SIGN_ERSTAUSROLLUNG": "true"}
     env.update(aenderung)
     return env
 
@@ -241,14 +241,17 @@ class Eingaben(unittest.TestCase):
         self.assertEqual(sig.ablage_dateiname(BID, "quality"), "quality.json")
         self.assertEqual(sig.ablage_dateiname(BID, "signed"), e["asset"])
         e = sig.lese_eingaben(gueltige_eingaben(SIGN_ERSTAUSROLLUNG="false", SIGN_VORGAENGER_ID="R-0123456789ab",
-                                                SIGN_SHA256="A" * 64))
-        self.assertEqual((e["vorgaenger_id"], e["erstausrollung"], e["sha256"]), ("R-0123456789ab", False, "a" * 64))
+                                                SIGN_SHA256="A" * 64, SIGN_QUALITY_SHA256="C" * 64))
+        self.assertEqual((e["vorgaenger_id"], e["erstausrollung"], e["sha256"], e["quality_sha256"]),
+                         ("R-0123456789ab", False, "a" * 64, "c" * 64))
 
     def test_ungueltige_eingaben(self):
         faelle = {
             "eingabe_build_id": [{"SIGN_BUILD_ID": "2026-11-09"}, {"SIGN_BUILD_ID": "20261340-120000"},
                                  {"SIGN_BUILD_ID": "kunde-20261109-120000"}, {"SIGN_BUILD_ID": "../20261109-120000"}],
             "eingabe_sha256": [{"SIGN_SHA256": "a" * 63}, {"SIGN_SHA256": "g" * 64}],
+            "eingabe_quality_sha256": [{"SIGN_QUALITY_SHA256": ""}, {"SIGN_QUALITY_SHA256": "c" * 63},
+                                       {"SIGN_QUALITY_SHA256": "z" * 64}],
             "eingabe_version": [{"SIGN_VERSION": ""}, {"SIGN_VERSION": "1.0 beta"}],
             "eingabe_kanal": [{"SIGN_KANAL": "live"}],
             "eingabe_vorgaenger": [{"SIGN_VORGAENGER_ID": "R 1", "SIGN_ERSTAUSROLLUNG": "false"}],
@@ -655,6 +658,48 @@ class FakeAblageVertrag(unittest.TestCase):
         self.assertEqual(code_von(sig.Ablage(fake_storage.DateiTransport(self.tmp), "x" * 20).manifest, BID), "storage_token")
 
 
+class QualityBindung(unittest.TestCase):
+    """quality.json ist per Dispatch-Eingabe quality_sha256 an den lokal geprüften Nachweis gebunden."""
+
+    def test_geprueften_nachweis_nur_mit_eingabe_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pfad = os.path.join(tmp, "qualitaet.json")
+            with open(pfad, "w", encoding="utf-8") as fh:
+                json.dump({"build_id": BID, "bestanden": True, "remote_e2e_fps": 15.2, "sha256": "c" * 64}, fh)
+            self.assertEqual(sig._lies_qualitaet({"qualitaet": pfad}, BID, "c" * 64)["sha256"], "c" * 64)
+            self.assertEqual(code_von(sig._lies_qualitaet, {"qualitaet": pfad}, BID, "d" * 64), "quality_abweichung")
+
+    def test_qualitaet_gegen_eingabe_hash(self):
+        """Unterbefehl qualitaet: Manifest-Hash und Download müssen = SIGN_QUALITY_SHA256 sein."""
+        tmp = tempfile.mkdtemp(prefix="Insight Quality ")
+        try:
+            ablage = fake_storage.FakeAblage.einrichten(os.path.join(tmp, "Ablage"), TOKEN_TEST)
+            echt = tl.quality_bytes()
+            ersetzt = tl.quality_bytes(remote_e2e_fps=16.4)          # gültig, bestanden, gleiche Build-ID
+            ereignis_pfad = os.path.join(tmp, "ereignis.json")
+            with open(ereignis_pfad, "w", encoding="utf-8") as fh:
+                json.dump(ereignis(), fh)
+
+            def qualitaet(inhalt, soll):
+                ablage.roh_ablegen(BID, "quality", inhalt)
+                env = {k: os.environ[k] for k in ("PATH", "SYSTEMROOT") if k in os.environ}
+                env.update(gueltige_eingaben(SIGN_QUALITY_SHA256=soll), RUNNER_TEMP=tmp, GITHUB_REPOSITORY=REPO_BSP,
+                           GITHUB_EVENT_PATH=ereignis_pfad, SIGN_STORAGE_FAKE=os.path.join(tmp, "Ablage"),
+                           PYTHONIOENCODING="utf-8", **{"SIGNING_STORAGE_TOKEN": TOKEN_TEST})
+                return subprocess.run([sys.executable, os.path.join(SIGNING, "artifact_signing.py"), "qualitaet"], env=env,
+                                      capture_output=True, text=True, timeout=60)
+
+            p = qualitaet(echt, hashlib.sha256(echt).hexdigest())
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            os.remove(os.path.join(tmp, "insight-signing", "qualitaet.json"))
+            p = qualitaet(ersetzt, hashlib.sha256(echt).hexdigest())
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertIn("FEHLER [quality_abweichung]", p.stderr)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "insight-signing", "qualitaet.json")))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class Konsistenz(unittest.TestCase):
     def test_ausgaben_pins_und_doku(self):
         self.assertEqual(set(sig.AUSGABEN), set(sig.BEFEHLE))
@@ -726,6 +771,10 @@ class WorkflowPruefung(unittest.TestCase):
                 if "uses" in s:
                     self.assertNotIn("secrets.", json.dumps(s))
         self.assertEqual(self.gut.count("${{ secrets.SIGNING_STORAGE_TOKEN }}"), 6)
+        eingabe = wf["on"]["workflow_dispatch"]["inputs"]["quality_sha256"]
+        self.assertEqual((eingabe["type"], eingabe["required"]), ("string", True))
+        for name in ("vorpruefung", "signieren"):
+            self.assertEqual(wf["jobs"][name]["env"]["SIGN_QUALITY_SHA256"], "${{ inputs.quality_sha256 }}")
         for verboten in ("gh release", "prerelease", "archive: false", "quality_testrun", "setup-dotnet"):
             self.assertNotIn(verboten, self.gut.lower())
 
@@ -798,6 +847,8 @@ class WorkflowPruefung(unittest.TestCase):
             ("${{ steps.vorpruefen.outputs.datei }}", "${{ steps.vorpruefen.outputs.pfad }}", {"ausdruck_ref", "action_konfig"}),
             ("${{ steps.vorpruefen.outputs.datei }}", "${{ steps.nachpruefen.outputs.sha256_signiert }}", {"ausdruck_ref", "action_konfig"}),
             ("SIGN_SHA256: ${{ inputs.sha256 }}", "SIGN_SHA256: ${{ github.event.inputs.sha256 }}", {"ausdruck", "eingaben_env"}),
+            ("      SIGN_QUALITY_SHA256: ${{ inputs.quality_sha256 }}\n", "", {"eingaben_env"}),
+            ("SIGN_QUALITY_SHA256: ${{ inputs.quality_sha256 }}", "SIGN_QUALITY_SHA256: ${{ inputs.sha256 }}", {"eingaben_env"}),
             ("          file-digest: SHA256\n", "          file-digest: SHA1\n", {"action_konfig"}),
             ("runs-on: windows-2025", "runs-on: windows-latest", {"runner"}),
             ("          SIGN_HERAUSGEBER: ${{ vars.ARTIFACT_SIGNING_PUBLISHER }}\n",
@@ -854,6 +905,12 @@ class Trockenlauf(unittest.TestCase):
                         "upload_abweichung"):
             self.assertIn(pflicht, codes)
         self.assertIsNone(self.laeufe["erfolg_oeffentlich"].s.erwartet)     # öffentliches Repo signiert
+        for name, erwartet in (("quality_ersetzt_nach_vorpruefung", ("signieren", "qualitaet", "quality_abweichung")),
+                               ("quality_anderer_nachweis", ("vorpruefung", "qualitaet", "quality_abweichung")),
+                               ("eingabe_quality_sha256", ("vorpruefung", "eingaben", "eingabe_quality_sha256"))):
+            with self.subTest(szenario=name):
+                self.assertEqual(self.laeufe[name].s.erwartet, erwartet)
+                self.assertEqual(tl.ergebnis(self.laeufe[name]), erwartet)
 
     def test_erfolg_argumente_ablage_und_hashes(self):
         lauf = self.laeufe["erfolg"]
@@ -978,8 +1035,8 @@ class Vorbereiten(unittest.TestCase):
             with open(os.path.join(ziel, "quality-%s.json" % BID), "rb") as fh:
                 self.assertEqual(fh.read(), tl.quality_bytes())
             sha, sha_q = hashlib.sha256(data).hexdigest(), hashlib.sha256(tl.quality_bytes()).hexdigest()
-            self.assertIn("-f build_id=%s -f sha256=%s -f version=2026.11.1 -f kanal=pilot -f erstausrollung=true" % (BID, sha),
-                          befehle)
+            self.assertIn("-f build_id=%s -f sha256=%s -f quality_sha256=%s -f version=2026.11.1 -f kanal=pilot "
+                          "-f erstausrollung=true" % (BID, sha, sha_q), befehle)
             self.assertIn("ABLAGE=%s" % BASIS, befehle)
             self.assertIn("-X PUT -H @- -H 'X-Artifact-SHA256: %s' -H 'Content-Type: application/octet-stream' "
                           "--data-binary @'%s' \"$ABLAGE/%s/unsigned\"" % (sha, kopie, BID), befehle)
@@ -1043,8 +1100,10 @@ def pruefe_befehle(test, befehle, repo):
     test.assertNotIn("<", befehle.replace("<<", ""))                     # keine Platzhalter
     test.assertNotIn("$SIGNING_STORAGE_TOKEN\"", " ".join(z for z in zeilen if z.startswith("curl") or "| curl" in z))
     curls = [z for z in zeilen if "curl " in z]
-    test.assertEqual(len(curls), 6, curls)                               # health, 2× PUT, manifest, GET signed, DELETE (Funktion)
+    # health, 2× PUT, manifest, GET signed; in den Funktionen: Manifest vor dem Löschen, DELETE
+    test.assertEqual(len(curls), 7, curls)
     for z in curls:
+        test.assertEqual(z.count("curl "), 1, z)
         teil = z[z.index("curl "):]
         test.assertTrue(teil.startswith("curl --proto =https --tlsv1.2 -fsS"), z)
         test.assertNotIn("Authorization", teil)
@@ -1052,7 +1111,7 @@ def pruefe_befehle(test, befehle, repo):
         test.assertNotIn("-k", teil.split())
         test.assertNotIn("--insecure", teil)
         if "health" not in teil:
-            test.assertTrue(z.startswith("ablage_kopf | curl "), z)
+            test.assertIn("ablage_kopf | curl ", z)                     # Token nur über ablage_kopf (stdin)
             test.assertIn("-H @-", teil)
     test.assertIn("ablage_kopf() { printf 'Authorization: Bearer %s\\n' \"${SIGNING_STORAGE_TOKEN:?}\"; }", zeilen)
     test.assertEqual(sum("--data-binary" in z for z in zeilen), 2)
@@ -1069,7 +1128,8 @@ def pruefe_befehle(test, befehle, repo):
     test.assertTrue(listen[0].startswith("VORHER=\"$(") and "laeufe-vorher %s" % BID in listen[0], listen[0])
     test.assertTrue(listen[1].startswith("LAUF=\"$(") and "lauf-id %s \"${VORHER:?" % BID in listen[1], listen[1])
     reihenfolge = ["trap aufraeumen EXIT", "/api/signing/health", "/unsigned\"", "HOCHGELADEN=1", "/quality\"",
-                   "manifest-pruefen", "laeufe-vorher", "gh workflow run", "lauf-id", "gh run watch", "LAUF_OK=1",
+                   "manifest-pruefen", "laeufe-vorher", "GESTARTET=1", "gh workflow run", "lauf-id", "gh run watch",
+                   "LAUF_OK=1",
                    "gh run download", "nachweis-pruefen", "/signed\"", "ergebnis-pruefen"]
     positionen = [befehle.index(t, befehle.index("trap aufraeumen EXIT")) for t in reihenfolge]
     test.assertEqual(positionen, sorted(positionen), reihenfolge)
@@ -1077,8 +1137,25 @@ def pruefe_befehle(test, befehle, repo):
     kopf = [z for z in befehle.splitlines() if z.startswith("# ") and "Aufräumen" in z]
     test.assertEqual(len(kopf), 1, kopf)
     test.assertIn("IMMER", kopf[0])
-    test.assertIn("if [ \"$HOCHGELADEN\" = 1 ] && [ \"$LAUF_OK\" != 1 ]; then", zeilen)
     test.assertEqual(sum("-X DELETE" in z for z in zeilen), 1)
+    # Löschen nur über die Prüfung loeschen_erlaubt (Lauf-Ausgang per gh run view + Manifest), nie allein nach Flags
+    test.assertIn("if [ \"$HOCHGELADEN\" = 1 ] && [ \"$LAUF_OK\" != 1 ] && loeschen_erlaubt; then", zeilen)
+    test.assertIn("loeschen-pruefen %s" % BID, befehle)
+    test.assertIn("gh run view --repo %s" % repo, befehle)
+    # HOCHGELADEN / GESTARTET / LAUF_OK nur abhängig vom Exit-Code (auch ohne set -e): nie als eigene Zeile
+    for flag in ("HOCHGELADEN=1", "LAUF_OK=1"):
+        test.assertNotIn(flag, zeilen)
+        test.assertEqual(sum(flag in z for z in zeilen), 1, flag)
+    test.assertTrue([z for z in zeilen if "/unsigned\"" in z][0].startswith("if ablage_kopf | curl "))
+    test.assertIn("then HOCHGELADEN=1; else exit 1; fi", befehle)
+    test.assertTrue([z for z in zeilen if z.startswith("if gh run watch")][0].endswith("then LAUF_OK=1; else exit 1; fi"))
+    test.assertLess(befehle.index("GESTARTET=1"), befehle.index("gh workflow run"))
+    # jeder Prüf-/Netzbefehl nach Block 0 bricht auch ohne set -e ab
+    rumpf = zeilen[zeilen.index("trap aufraeumen EXIT") + 1:-1]
+    for z in rumpf:
+        if z.startswith(("echo ", "GESTARTET=", "sleep ")):
+            continue
+        test.assertTrue(z.endswith(("|| exit 1", "; exit 1; }", "; else exit 1; fi")), z)
 
 
 def lauf(nummer, build_id=BID, **aenderung):
@@ -1153,7 +1230,19 @@ if a[:2] == ["run", "watch"]:
         import fake_storage
         fake_storage.FakeAblage(os.environ["FAKE_STORAGE_ORDNER"], quelle="workflow").roh_ablegen(
             bid, "signed", open(daten["installer"], "rb").read())
+    if "watch_exit" in daten:    # nur die Beobachtung scheitert (Netz, Strg-C, Terminal zu) – Lauf läuft weiter
+        sys.exit(daten["watch_exit"])
     sys.exit(0 if a[-2] == daten["lauf"] and daten.get("lauf_gruen", True) else 1)
+if a[:2] == ["run", "view"]:
+    if "--json" not in a or "conclusion" not in a[a.index("--json") + 1].split(","):
+        sys.exit(2)
+    stand = daten.get("lauf_stand", "standard")
+    if stand == "fehler":
+        print("HTTP 502: Bad Gateway", file=sys.stderr); sys.exit(1)
+    if stand == "standard":
+        stand = {"databaseId": int(daten["lauf"]), "status": "completed",
+                 "conclusion": "success" if daten.get("lauf_gruen", True) else "failure"}
+    print(json.dumps(stand)); sys.exit(0)
 if a[:2] == ["workflow", "run"]:
     sys.exit(0)
 if a[:2] == ["run", "download"]:
@@ -1391,19 +1480,22 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
             self.assertEqual(ablage.inhalt(BID, "signed"), vorher)
             aufgeraeumt(kopie)
 
-            # Race: neuer Lauf nicht gelistet → Abbruch vor dem Lauf; eigener Upload wird gelöscht (kein grüner Lauf)
+            # Race: Lauf gestartet, aber nicht bestimmbar → Ausgang unbekannt → nichts löschen (Retention)
             p, kopie, aufrufe, ablage = ausfuehren(laeufe_folge=[[lauf(4700)], [lauf(4700)]])
             self.assertNotEqual(p.returncode, 0)
             self.assertIn("lauf_fehlt", p.stderr)
             self.assertFalse([a for a in aufrufe if a[:2] in (["run", "watch"], ["run", "download"])])
-            self.assertEqual(ablage_anfragen(ablage)[-1][:3], ("DELETE", BID, 200))
-            self.assertIsNone(ablage.inhalt(BID, "unsigned"))
+            self.assertFalse([a for a in ablage_anfragen(ablage) if a[0] == "DELETE"])
+            self.assertIsNotNone(ablage.inhalt(BID, "unsigned"))
+            self.assertIn("nicht von Hand löschen", p.stderr)
             aufgeraeumt(kopie)
 
-            # Roter Lauf → eigener Upload gelöscht, kein Download
+            # Roter Lauf (gh run view: completed/failure), kein signed → eigener Upload gelöscht, kein Download
             p, kopie, aufrufe, ablage = ausfuehren(lauf_gruen=False, signieren=False)
             self.assertNotEqual(p.returncode, 0)
-            self.assertEqual(ablage_anfragen(ablage)[-1][:3], ("DELETE", BID, 200))
+            self.assertEqual(ablage_anfragen(ablage)[-2:], [("GET", "manifest", 200, "ok"), ("DELETE", BID, 200, "ok")])
+            self.assertIn(["run", "view", "--repo", "beispiel/cockpit-signing", "4711", "--json",
+                           "databaseId,status,conclusion"], aufrufe)
             self.assertFalse([a for a in aufrufe if a[:2] == ["run", "download"]])
             aufgeraeumt(kopie)
 
@@ -1432,6 +1524,127 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
             aufgeraeumt(kopie)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loeschschutz_mit_und_ohne_set_e(self):
+        """G1/G2: Signierte oder fremde Artefakte werden nie gelöscht – weder nach PUT-409/Uploadfehler (auch in einer
+        offenen bash ohne set -e) noch wenn nur gh run watch scheitert. Gelöscht wird nur ein eigener Upload ohne signed,
+        dessen Lauf nachweislich (gh run view) fehlgeschlagen ist oder der nie gestartet wurde."""
+        signiert, bericht = signiertes_ergebnis()
+        tmp = tempfile.mkdtemp(prefix="Insight Loeschschutz ")
+        try:
+            quelle, q = lege_quelle(tmp)
+            ziel = os.path.join(tmp, "Ausgang")
+            installer = os.path.join(tmp, "signiert.bin")
+            with open(installer, "wb") as fh:
+                fh.write(signiert)
+            basis = {"build_id": BID, "lauf": "4711", "installer": installer, "signieren": True,
+                     "nachweise": {"4711": nachweis_dateien(bericht)}, "laeufe_folge": [[], [lauf(4711)]]}
+            ablage_ordner = os.path.join(tmp, "Ablage")
+            frueher_signiert = fake_signtool.signiere_bytes(tl.baue_installer(), {"kette": [], "zeitstempel": None})
+            fremd_unsigned = tl.baue_installer(saat=99)
+            fremd_quality = tl.quality_bytes(remote_e2e_fps=9.5)
+
+            def ausfuehren(flags, vorbelegt=None, **aenderung):
+                shutil.rmtree(ablage_ordner, ignore_errors=True)
+                ablage = fake_storage.FakeAblage.einrichten(ablage_ordner, TOKEN_TEST)
+                for kind, daten in (vorbelegt or {}).items():
+                    ablage.roh_ablegen(BID, kind, daten)
+                _e, _k, befehle = vb.vorbereiten(quelle, q, "2026.11.1", "pilot", None, True, ziel, REPO_BSP)
+                env = self.umgebung(tmp, dict(basis, **aenderung))
+                p = subprocess.run(["bash", *flags, "-c", befehle], capture_output=True, text=True, env=env, timeout=120)
+                anfragen = [(a["methode"], a["pfad"].rsplit("/", 1)[-1], a["status"])
+                            for a in ablage.protokoll() if a["quelle"] == "curl"]
+                return p, anfragen, self.gh_aufrufe(tmp), ablage
+
+            kein_start = {"unsigned_vorhanden_signed": dict(vorbelegt={"unsigned": tl.baue_installer(),
+                                                                       "signed": frueher_signiert}),
+                          "unsigned_fremd": dict(vorbelegt={"unsigned": fremd_unsigned}),
+                          "quality_fremd": dict(vorbelegt={"quality": fremd_quality}),
+                          "nur_signed_vorhanden": dict(vorbelegt={"signed": frueher_signiert})}
+            nie_loeschen = {
+                "watch_fehler_lauf_gruen": dict(watch_exit=1),
+                "watch_abbruch_strg_c": dict(watch_exit=130),
+                "watch_fehler_ausgang_unbekannt": dict(watch_exit=1, signieren=False, lauf_stand="fehler"),
+                "watch_fehler_lauf_offen": dict(watch_exit=1, signieren=False,
+                                                lauf_stand={"databaseId": 4711, "status": "waiting", "conclusion": None}),
+                "watch_fehler_falscher_lauf": dict(watch_exit=1, signieren=False,
+                                                   lauf_stand={"databaseId": 4700, "status": "completed",
+                                                               "conclusion": "failure"}),
+                "lauf_rot_aber_signed_abgelegt": dict(lauf_gruen=False, signieren=True),
+                "lauf_unbestimmt": dict(laeufe_folge=[[], []], signieren=False),
+            }
+            for flags in (["-euo", "pipefail"], []):
+                modus = " ".join(flags) or "ohne set -e"
+                for name, fall in kein_start.items():
+                    with self.subTest(modus=modus, fall=name):
+                        vorher = {k: v for k, v in fall["vorbelegt"].items()}
+                        p, anfragen, aufrufe, ablage = ausfuehren(flags, **fall)
+                        self.assertNotEqual(p.returncode, 0, p.stderr)
+                        self.assertFalse([a for a in anfragen if a[0] == "DELETE"], anfragen)
+                        for kind, daten in vorher.items():
+                            self.assertEqual(ablage.inhalt(BID, kind), daten, kind)
+                        self.assertFalse([a for a in aufrufe if a[:2] == ["workflow", "run"]], "Start trotz Fehler")
+                        self.assertFalse([a for a in aufrufe if a[:2] == ["run", "watch"]])
+                for name, aenderung in nie_loeschen.items():
+                    with self.subTest(modus=modus, fall=name):
+                        p, anfragen, aufrufe, ablage = ausfuehren(flags, **aenderung)
+                        self.assertNotEqual(p.returncode, 0, p.stderr)
+                        self.assertFalse([a for a in anfragen if a[0] == "DELETE"], anfragen)
+                        self.assertIsNotNone(ablage.inhalt(BID, "unsigned"))
+                        if aenderung.get("signieren", True):
+                            self.assertEqual(ablage.inhalt(BID, "signed"), signiert)
+                        self.assertFalse([a for a in aufrufe if a[:2] == ["run", "download"]])
+                        self.assertIn("nicht von Hand löschen", p.stderr)
+                with self.subTest(modus=modus, fall="eigener_upload_lauf_rot"):
+                    p, anfragen, aufrufe, ablage = ausfuehren(flags, lauf_gruen=False, signieren=False)
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertEqual(anfragen[-1], ("DELETE", BID, 200))
+                    self.assertIsNone(ablage.inhalt(BID, "unsigned"))
+                with self.subTest(modus=modus, fall="eigener_upload_abgebrochen"):
+                    p, anfragen, aufrufe, ablage = ausfuehren(flags, watch_exit=1, signieren=False, lauf_stand={
+                        "databaseId": 4711, "status": "completed", "conclusion": "cancelled"})
+                    self.assertNotEqual(p.returncode, 0)
+                    self.assertEqual(anfragen[-1], ("DELETE", BID, 200))
+                with self.subTest(modus=modus, fall="erfolg"):
+                    ergebnis = os.path.join(ziel, "signiert-%s" % BID, sig.asset_name(BID))
+                    if os.path.exists(ergebnis):
+                        os.remove(ergebnis)
+                    p, anfragen, aufrufe, ablage = ausfuehren(flags)
+                    self.assertEqual(p.returncode, 0, p.stderr)
+                    self.assertTrue(os.path.exists(ergebnis))
+                    self.assertFalse([a for a in anfragen if a[0] == "DELETE"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_loeschen_pruefen(self):
+        sha, sha_q = "b" * 64, "c" * 64
+        eigen = manifest(unsigned=(sha, 10), quality=(sha_q, 5))
+        rot = {"databaseId": 4711, "status": "completed", "conclusion": "failure"}
+        erlaubt = [(eigen, None, None), (manifest(unsigned=(sha, 10)), None, None)]
+        erlaubt += [(eigen, "4711", dict(rot, conclusion=c)) for c in ("failure", "cancelled", "timed_out", "startup_failure")]
+        for m, lauf_id, stand in erlaubt:
+            with self.subTest(erlaubt=(lauf_id, stand)):
+                self.assertIsNone(vb.loeschen_pruefen(m, BID, sha, sha_q, lauf_id, stand))
+        mit_signed = manifest(unsigned=(sha, 10), quality=(sha_q, 5), signed=("e" * 64, 12))
+        faelle = {
+            "signiert_vorhanden": [(mit_signed, None, None), (mit_signed, "4711", rot),
+                                   (manifest(unsigned=(sha, 10), signed=("e" * 64, 12)), None, None)],
+            "fremder_upload": [(manifest(unsigned=("d" * 64, 10), quality=(sha_q, 5)), None, None),
+                               (manifest(unsigned=(sha, 10), quality=("d" * 64, 5)), None, None)],
+            "asset_fehlt": [(manifest(quality=(sha_q, 5)), None, None)],
+            "manifest_ungueltig": [(None, None, None), (manifest(build_id="20261109-120001", unsigned=(sha, 10)), None, None)],
+            "lauf_nicht_fehlgeschlagen": [(eigen, "4711", dict(rot, conclusion=c))
+                                          for c in ("success", "neutral", "skipped", "action_required", None, "")],
+            "lauf_offen": [(eigen, "4711", dict(rot, status=s, conclusion=None))
+                           for s in ("queued", "in_progress", "waiting", "pending", "requested", None)],
+            "lauf_unbekannt": [(eigen, "4711", None), (eigen, "4711", []), (eigen, "4711", dict(rot, databaseId=4700)),
+                               (eigen, "4711", dict(rot, databaseId="4711x")), (eigen, None, rot)],
+            "lauf_liste": [(eigen, "47; rm", rot)],
+        }
+        for code, varianten in faelle.items():
+            for m, lauf_id, stand in varianten:
+                with self.subTest(code=code, lauf=lauf_id, stand=stand):
+                    self.assertEqual(code_von(vb.loeschen_pruefen, m, BID, sha, sha_q, lauf_id, stand), code)
 
     def test_curl_double_lehnt_token_als_argument_ab(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1475,6 +1688,24 @@ class VorbereitenErgebnisLaden(unittest.TestCase):
         self.assertIn("quality_fehlt", p.stderr)
         p = cli("manifest-pruefen", BID, sha, eingabe="{}")
         self.assertEqual((p.returncode, p.stdout), (2, ""))
+        eigen = json.dumps(manifest(unsigned=(sha, 10), quality=(sha_q, 5)))
+        rot = json.dumps({"databaseId": 4711, "status": "completed", "conclusion": "failure"})
+        gruen = json.dumps({"databaseId": 4711, "status": "completed", "conclusion": "success"})
+        p = cli("loeschen-pruefen", BID, sha, sha_q, "-", "-", eingabe=eigen)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        p = cli("loeschen-pruefen", BID, sha, sha_q, "4711", rot, eingabe=eigen)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for lauf_id, stand, eingabe, code in (("4711", gruen, eigen, "lauf_nicht_fehlgeschlagen"),
+                                              ("4711", "kein json", eigen, "lauf_unbekannt"),
+                                              ("4711", "-", eigen, "lauf_unbekannt"),
+                                              ("-", "-", "", "manifest_ungueltig"),
+                                              ("-", "-", json.dumps(manifest(unsigned=(sha, 10), signed=(sha, 9))),
+                                               "signiert_vorhanden")):
+            with self.subTest(code=code):
+                p = cli("loeschen-pruefen", BID, sha, sha_q, lauf_id, stand, eingabe=eingabe)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn("[%s]" % code, p.stderr)
+                self.assertIn("nichts gelöscht", p.stderr)
         _s, bericht = signiertes_ergebnis()
         tmp = tempfile.mkdtemp(prefix="Insight CLI ")
         try:

@@ -16,8 +16,10 @@ Trockenlauf und in Tests ein Fake (tools/signing/fake_storage.py) – nie echtes
 
 Konfiguration ausschließlich über Umgebungsvariablen (der Workflow reicht Eingaben nur über env weiter, nie als
 Ausdruck in Shell-Code):
-  SIGN_BUILD_ID, SIGN_SHA256, SIGN_VERSION, SIGN_KANAL,
-  SIGN_VORGAENGER_ID, SIGN_ERSTAUSROLLUNG     Workflow-Eingaben
+  SIGN_BUILD_ID, SIGN_SHA256, SIGN_QUALITY_SHA256,
+  SIGN_VERSION, SIGN_KANAL,
+  SIGN_VORGAENGER_ID, SIGN_ERSTAUSROLLUNG     Workflow-Eingaben (SIGN_QUALITY_SHA256 bindet quality.json an den lokal
+                                             geprüften und freigegebenen Nachweis – kein Ersatz per replace=1)
   SIGNING_STORAGE_TOKEN                      Bearer-Token der Ablage (Repo-Secret, nur in den Ablage-Schritten)
   SIGN_HERAUSGEBER                           erwarteter Zertifikatsinhaber (vars.ARTIFACT_SIGNING_PUBLISHER)
   RUNNER_TEMP, GITHUB_*                      vom Runner gesetzt (GITHUB_EVENT_PATH: repository.full_name wird geprüft)
@@ -30,7 +32,8 @@ Unterbefehle in Workflow-Reihenfolge:
   eingaben        Eingaben prüfen, Dateinamen ableiten (nur Build-ID, keine Kundennamen)
   umgebung        Repository (full_name, öffentlich oder privat); Environment release-signing: Pflicht-Reviewer,
                   kein Admin-Bypass, nur Zweig main
-  qualitaet       Qualitätsnachweis quality.json aus der Ablage: Manifest-Hash, bestanden=true, Build-ID, remote_e2e_fps
+  qualitaet       Qualitätsnachweis quality.json aus der Ablage: Manifest-Hash = Download = Eingabe quality_sha256,
+                  bestanden=true, Build-ID, remote_e2e_fps
   laden           Manifest (genau ein unsigned, Name, Größe, SHA-256 = Eingabe, noch kein signed) und Download
   vorpruefen      SHA-256, PE/NSIS-Kennung, Hersteller, Build-ID (Versionsressource), unsigniert → Manifest
   nachpruefen     Zertifikatstabelle, Inhalt unverändert, signtool verify /pa /tw /v, Kette, Zeitstempel,
@@ -157,6 +160,9 @@ def lese_eingaben(env=None):
     sha256 = (env.get("SIGN_SHA256") or "").strip().lower()
     if not SHA256_RE.match(sha256):
         raise SigningError("eingabe_sha256", "SHA-256 muss aus 64 Hex-Zeichen bestehen")
+    quality_sha256 = (env.get("SIGN_QUALITY_SHA256") or "").strip().lower()
+    if not SHA256_RE.match(quality_sha256):
+        raise SigningError("eingabe_quality_sha256", "SHA-256 des Qualitätsnachweises muss aus 64 Hex-Zeichen bestehen")
     version = (env.get("SIGN_VERSION") or "").strip()
     if not VERSION_RE.match(version):
         raise SigningError("eingabe_version", "Version ungültig (erlaubt: Buchstaben, Ziffern, . + -, max. 40)")
@@ -172,8 +178,8 @@ def lese_eingaben(env=None):
     erst = erst_roh == "true"
     if bool(vorgaenger) == erst:
         raise SigningError("eingabe_rollback", "Genau eins angeben: Vorgänger-ID (Rollback-Ziel) oder Erstausrollung")
-    return {"build_id": build_id, "sha256": sha256, "version": version, "kanal": kanal, "vorgaenger_id": vorgaenger,
-            "erstausrollung": erst, "asset": asset_name(build_id)}
+    return {"build_id": build_id, "sha256": sha256, "quality_sha256": quality_sha256, "version": version, "kanal": kanal,
+            "vorgaenger_id": vorgaenger, "erstausrollung": erst, "asset": asset_name(build_id)}
 
 
 def arbeitsordner(env=None):
@@ -838,14 +844,10 @@ def cmd_eingaben():
     _ausgabe("asset", e["asset"])
     _zusammenfassung("Eingaben geprüft", [
         ("Build-ID", e["build_id"]), ("Erwarteter SHA-256 (unsigniert)", e["sha256"]),
+        ("Erwarteter SHA-256 (quality.json)", e["quality_sha256"]),
         ("Ablage", "%s/{unsigned,quality,signed}" % e["build_id"]), ("Installer", e["asset"]),
         ("Version / Kanal", "%s / %s" % (e["version"], e["kanal"])),
         ("Rollback", "Erstausrollung" if e["erstausrollung"] else "Vorgänger " + e["vorgaenger_id"])])
-
-
-def _erste_zeile(roh):
-    text = _dekodiere(roh or b"").strip()
-    return text.splitlines()[0][:200] if text else "keine Meldung"
 
 
 def _repo():
@@ -914,11 +916,14 @@ def cmd_qualitaet():
     p = _pfade(e)
     _repo_pruefen()
     ablage = _ablage()
-    eintrag = pruefe_manifest(ablage.manifest(e["build_id"]), e["build_id"], "quality", fehlt_code="quality_fehlt")
+    eintrag = pruefe_manifest(ablage.manifest(e["build_id"]), e["build_id"], "quality", e["quality_sha256"],
+                              fehlt_code="quality_fehlt", abweichung_code="quality_abweichung")
     roh = ablage.lade(e["build_id"], "quality", MAX_QUALITY, fehlt_code="quality_fehlt")
     sha = hashlib.sha256(roh).hexdigest()
     if sha != eintrag["sha256"] or len(roh) != eintrag["size"]:
         raise SigningError("quality_abweichung", "Geladener Qualitätsnachweis ≠ Manifest (SHA-256/Größe)")
+    if sha != e["quality_sha256"]:      # doppelt: Manifest-Hash wurde schon gegen die Eingabe geprüft
+        raise SigningError("quality_abweichung", "Qualitätsnachweis ≠ freigegebener Nachweis (Eingabe quality_sha256)")
     try:
         obj = json.loads(roh.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -930,7 +935,7 @@ def cmd_qualitaet():
     _ausgabe("remote_e2e_fps", "%g" % q["remote_e2e_fps"])
     _zusammenfassung("Qualitätsnachweis geprüft", [
         ("Build-ID", e["build_id"]), ("bestanden", "true"), ("remote_e2e_fps", "%g" % q["remote_e2e_fps"]),
-        ("SHA-256 quality.json", sha)])
+        ("SHA-256 quality.json", "%s (= Eingabe quality_sha256)" % sha)])
 
 
 def cmd_laden():
@@ -988,7 +993,7 @@ def cmd_vorpruefen():
         ("Authenticode-Hash", authenticode)])
 
 
-def _lies_qualitaet(p, build_id):
+def _lies_qualitaet(p, build_id, quality_sha256):
     try:
         with open(p["qualitaet"], encoding="utf-8") as fh:
             q = json.load(fh)
@@ -997,6 +1002,8 @@ def _lies_qualitaet(p, build_id):
     geprueft = pruefe_quality(q, build_id)
     if not isinstance(q.get("sha256"), str) or not SHA256_RE.match(q["sha256"]):
         raise SigningError("quality_fehlt", "Geprüfter Qualitätsnachweis ohne SHA-256")
+    if q["sha256"] != quality_sha256:
+        raise SigningError("quality_abweichung", "Geprüfter Qualitätsnachweis ≠ Eingabe quality_sha256")
     geprueft["sha256"] = q["sha256"]
     return geprueft
 
@@ -1013,7 +1020,7 @@ def cmd_nachpruefen():
         manifest = json.load(fh)
     if (manifest.get("asset"), manifest.get("build_id"), manifest.get("sha256_unsigniert")) != (e["asset"], e["build_id"], e["sha256"]):
         raise SigningError("manifest_abweichung", "Manifest passt nicht zu den Eingaben")
-    qualitaet = _lies_qualitaet(p, e["build_id"])
+    qualitaet = _lies_qualitaet(p, e["build_id"], e["quality_sha256"])
     unsigniert, signiert = _lies(p["unsigniert"]), _lies(p["signiert"], "signatur_fehlt")
     if hashlib.sha256(unsigniert).hexdigest() != e["sha256"]:
         raise SigningError("referenz_abweichung", "Referenzkopie des unsignierten Installers verändert")

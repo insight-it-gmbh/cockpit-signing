@@ -71,7 +71,8 @@ ACTIONS = {
 }
 
 # ---------------------------------------------------------------- Soll-Form des Workflows
-EINGABEN = {"build_id": ("string", True, None), "sha256": ("string", True, None), "version": ("string", True, None),
+EINGABEN = {"build_id": ("string", True, None), "sha256": ("string", True, None),
+            "quality_sha256": ("string", True, None), "version": ("string", True, None),
             "kanal": ("choice", True, ["intern", "pilot", "produktiv"]), "vorgaenger_id": ("string", False, None),
             "erstausrollung": ("boolean", False, None)}
 VARS = ("AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID", "ARTIFACT_SIGNING_ENDPOINT",
@@ -79,6 +80,7 @@ VARS = ("AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_SUBSCRIPTION_ID", "ARTIFACT
 SECRET = "SIGNING_STORAGE_TOKEN"
 SECRET_AUSDRUCK = "${{ secrets.%s }}" % SECRET
 SIGN_ENV = {"SIGN_BUILD_ID": "${{ inputs.build_id }}", "SIGN_SHA256": "${{ inputs.sha256 }}",
+            "SIGN_QUALITY_SHA256": "${{ inputs.quality_sha256 }}",
             "SIGN_VERSION": "${{ inputs.version }}", "SIGN_KANAL": "${{ inputs.kanal }}",
             "SIGN_VORGAENGER_ID": "${{ inputs.vorgaenger_id }}", "SIGN_ERSTAUSROLLUNG": "${{ inputs.erstausrollung }}"}
 UMGEBUNG = "release-signing"

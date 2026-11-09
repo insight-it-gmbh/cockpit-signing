@@ -4,11 +4,11 @@
 #   1. tests        Tests dieses Repositorys (Unit, Mutationen, Trockenlauf) und statische Workflow-Pruefung.
 #   2. vorpruefung  Repository an GITHUB_REPOSITORY gebunden (oeffentlich erlaubt: Installer liegen nie in GitHub).
 #                   Environment-Schutz pruefen (Pflicht-Reviewer, kein Admin-Bypass, nur Zweig main; actions: read
-#                   nur dafuer). Qualitaetsnachweis quality.json aus der privaten Ablage (bestanden=true, Build-ID,
-#                   remote_e2e_fps). Unsignierten Installer aus der Ablage laden (Manifest, Groesse, SHA-256) und
+#                   nur dafuer). Qualitaetsnachweis quality.json aus der privaten Ablage (SHA-256 = Eingabe
+#                   quality_sha256, bestanden=true, Build-ID, remote_e2e_fps). Unsignierten Installer aus der Ablage laden (Manifest, Groesse, SHA-256) und
 #                   pruefen: Build-ID der Versionsressource, NSIS-Kennung, Hersteller, noch unsigniert. Ohne Azure.
 #   3. signieren    Erst nach 1 und 2 und nach manueller Freigabe im Environment "release-signing": Qualitaet und
-#                   Installer erneut laden und pruefen (gleicher erwarteter SHA-256), OIDC-Anmeldung, Artifact
+#                   Installer erneut laden und pruefen (gleiche erwartete SHA-256), OIDC-Anmeldung, Artifact
 #                   Signing, Azure-Sitzung beenden, signtool verify /pa /tw /v, Inhalt unveraendert, Herausgeber,
 #                   Zeitstempel. Signierten Installer per PUT in die Ablage, erneut laden, Hash pruefen. Nachweise
 #                   (nur JSON, keine Installer) als GitHub-Artefakt. Jede Abweichung bricht ab.
@@ -45,6 +45,10 @@ on:
         type: string
       sha256:
         description: "SHA-256 des unsignierten Installers (64 Hex-Zeichen)"
+        required: true
+        type: string
+      quality_sha256:
+        description: "SHA-256 des lokal geprueften quality.json (64 Hex-Zeichen, aus vorbereiten.py)"
         required: true
         type: string
       version:
@@ -109,6 +113,7 @@ jobs:
     env:
       SIGN_BUILD_ID: ${{ inputs.build_id }}
       SIGN_SHA256: ${{ inputs.sha256 }}
+      SIGN_QUALITY_SHA256: ${{ inputs.quality_sha256 }}
       SIGN_VERSION: ${{ inputs.version }}
       SIGN_KANAL: ${{ inputs.kanal }}
       SIGN_VORGAENGER_ID: ${{ inputs.vorgaenger_id }}
@@ -164,6 +169,7 @@ jobs:
     env:
       SIGN_BUILD_ID: ${{ inputs.build_id }}
       SIGN_SHA256: ${{ inputs.sha256 }}
+      SIGN_QUALITY_SHA256: ${{ inputs.quality_sha256 }}
       SIGN_VERSION: ${{ inputs.version }}
       SIGN_KANAL: ${{ inputs.kanal }}
       SIGN_VORGAENGER_ID: ${{ inputs.vorgaenger_id }}
